@@ -86,10 +86,15 @@ TRACE_MAX_BYTES = _env_int("HAILO_PROXY_TRACE_MAX_BYTES", 250000)
 #  - Token caps below are intentionally tight. Benchmarks showed that raising
 #    the cap (e.g. 320/384) makes the 1.7B model run into degenerate repetition
 #    loops and jumps latency from ~12s to 40-66s. 192/128 keeps replies fast & clean.
+#  - EXCEPTION: code-generation tasks need more room (a small class easily
+#    exceeds 192 tokens and gets truncated mid-function). For those we allow a
+#    higher CODE cap — structured code is far less prone to the prose repetition
+#    loops that motivated the tight default.
 #  - frequency_penalty / presence_penalty were tested and HURT this small model
 #    (produced broken loops like 'der Prozyn der Prozyn...'), so they stay unset.
 #  - temperature 0.15 / top_p 0.85 give correct, stable factual answers.
 MAX_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_MAX_TOKENS", 192)
+CODE_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_CODE_TOKENS", 512)
 DEFAULT_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_DEFAULT_TOKENS", 128)
 MAX_HISTORY_MESSAGES = _env_int("HAILO_PROXY_MAX_HISTORY_MESSAGES", 4)
 MAX_MESSAGE_CONTENT_CHARS = _env_int("HAILO_PROXY_MAX_MESSAGE_CHARS", 1200)
@@ -342,6 +347,24 @@ def clean_user_query(text):
     return t or str(text or "").strip()
 
 
+def is_code_task(user_message):
+    """Detect programming/code-generation requests.
+
+    Such tasks need a higher token budget than chat (a small class easily
+    exceeds 192 tokens) and must never be web-grounded. Structured code is far
+    less prone to the prose repetition loops that justify the tight default cap.
+    """
+    text = str(user_message or "").lower()
+    markers = [
+        "schreib", "programmier", "code", "coden", "funktion", "function",
+        "python", "javascript", " java", "bash", "skript", "script",
+        "schleife", "loop", "klasse", "class ", "algorithm", "algorithmus",
+        "refactor", "debug", "def ", "html", "css", "sql", "regex",
+        "json", "yaml", "api", "methode", "method",
+    ]
+    return any(m in text for m in markers)
+
+
 def should_trigger_web_search(user_message):
     """Decide if a message genuinely needs a live web lookup.
 
@@ -506,6 +529,7 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
         k: v for k, v in data.items() if k in ALLOWED_CHAT_FIELDS and v is not None
     }
     tools_payload = sanitized.pop("tools", None)
+    clean_query = ""
     if not tool_prompt_enabled:
         tools_payload = None
     if tools_payload is not None:
@@ -587,7 +611,16 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
         requested_tokens = DEFAULT_PROXY_COMPLETION_TOKENS
 
     model_id = sanitized.get("model")
-    sanitized["max_tokens"] = min(requested_tokens, model_token_cap(model_id), MAX_PROXY_COMPLETION_TOKENS)
+    per_model_cap = model_token_cap(model_id)
+    proxy_cap = MAX_PROXY_COMPLETION_TOKENS
+    # Coding tasks need more room so functions/classes aren't truncated. Raise
+    # BOTH the per-model and the global proxy ceiling, and apply a sensible
+    # floor so a stingy client max_tokens can't truncate code either.
+    if is_code_task(clean_query):
+        proxy_cap = CODE_PROXY_COMPLETION_TOKENS
+        per_model_cap = max(per_model_cap, CODE_PROXY_COMPLETION_TOKENS)
+        requested_tokens = max(requested_tokens, 384)
+    sanitized["max_tokens"] = min(requested_tokens, per_model_cap, proxy_cap)
     # Web-grounded answers: the useful fact is in the first 1-2 sentences. Cap
     # tighter so the small model stops before it degenerates into number loops
     # ("1. Halbzeit, 2., 3., ..."). collapse_repetition cleans the rest.
@@ -881,6 +914,45 @@ def remap_tool_call(tool_call, latest_user_text, allowed_tool_names):
     return tool_call
 
 
+def _collapse_prose(text):
+    """De-duplicate run-away repeated sentences/phrases in a prose segment.
+
+    Preserves newlines so lists ("1. ...\n2. ...") and paragraphs keep their
+    structure. Only consecutive/duplicate sentence content is removed.
+    """
+    # Process line by line so newlines (lists, paragraphs) survive.
+    out_lines = []
+    seen = set()
+    for line in text.split("\n"):
+        # Split a line into sentence-like chunks for de-duplication.
+        parts = re.split(r"(?<=[.!?])\s+", line.strip())
+        kept = []
+        for part in parts:
+            norm = re.sub(r"\s+", " ", part.strip().lower())
+            norm = re.sub(r"[^\w ]", "", norm)
+            if not norm:
+                if part.strip():
+                    kept.append(part.strip())
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            kept.append(part.strip())
+        out_lines.append(" ".join(kept))
+    result = "\n".join(out_lines)
+    # Collapse immediate repeated word groups within a line, tolerating
+    # whitespace OR punctuation separators ("die WM, die WM, die WM").
+    result = re.sub(r"(.{3,50}?)(?:[ \t,;:.\u2013-]+\1){2,}", r"\1", result)
+    # Collapse runaway enumerations like "M1, M2, M3, ... M28" to first 3 items.
+    enum = re.search(r"((?:[A-Za-z]?\d+,\s*){5,})", result)
+    if enum:
+        head = ", ".join(enum.group(1).split(",")[:3]).strip().rstrip(",")
+        result = result[:enum.start()] + head + " usw." + result[enum.end():]
+    # Squash 3+ blank lines down to a single blank line.
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
 def collapse_repetition(text):
     """Remove run-away repeated sentences/phrases from small-model output.
 
@@ -888,36 +960,36 @@ def collapse_repetition(text):
     "Die Tuerkei spielt heute. Die Tuerkei spielt heute. ...". This collapses
     consecutive duplicate (or near-duplicate) sentences and immediate phrase
     repetitions so the user gets a clean answer.
+
+    CRITICAL: fenced code blocks (```...```) and their newlines are preserved
+    verbatim. The previous version rejoined everything with single spaces,
+    which destroyed indentation and made every emitted Python/JS snippet
+    invalid. We now only de-duplicate the PROSE segments and never touch the
+    bytes inside code fences.
     """
     if not text or not isinstance(text, str):
         return text
 
-    # Split into sentence-like chunks.
-    parts = re.split(r"(?<=[.!?\n])\s+", text.strip())
-    cleaned = []
-    seen = set()
-    for part in parts:
-        norm = re.sub(r"\s+", " ", part.strip().lower())
-        norm = re.sub(r"[^\w ]", "", norm)
-        if not norm:
-            continue
-        # Drop any sentence already emitted (handles cyclic A B A B loops).
-        if norm in seen:
-            continue
-        seen.add(norm)
-        cleaned.append(part.strip())
-
-    result = " ".join(cleaned)
-
-    # Collapse immediate repeated word groups, tolerating whitespace OR
-    # punctuation separators (e.g. "der DFA der DFA", "die WM, die WM, die WM").
-    result = re.sub(r"(.{3,50}?)(?:[\s,;:.\u2013-]+\1){2,}", r"\1", result)
-    # Collapse runaway enumerations like "M1, M2, M3, ... M28" to first 3 items.
-    enum = re.search(r"((?:[A-Za-z]?\d+,\s*){5,})", result)
-    if enum:
-        head = ", ".join(enum.group(1).split(",")[:3]).strip().rstrip(",")
-        result = result[:enum.start()] + head + " usw." + result[enum.end():]
-    return result.strip()
+    # Split on fenced code blocks, keeping the fences. Odd indices are code.
+    # An UNCLOSED fence (model truncated mid-code) would otherwise be treated as
+    # prose and get its indentation stripped — guard against that by closing a
+    # dangling opening fence at end-of-text first.
+    if text.count("```") % 2 == 1:
+        text = text + "\n```"
+    segments = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    rebuilt = []
+    for i, seg in enumerate(segments):
+        if i % 2 == 1:
+            # Code block: pass through untouched (preserve all newlines/indent).
+            # Guarantee the opening/closing fences sit on their own line so
+            # Markdown renders the block correctly.
+            if rebuilt and not rebuilt[-1].endswith("\n"):
+                rebuilt.append("\n")
+            rebuilt.append(seg)
+            rebuilt.append("\n")
+        else:
+            rebuilt.append(_collapse_prose(seg) if seg.strip() else seg)
+    return "".join(rebuilt).strip()
 
 
 def sanitize_response(
