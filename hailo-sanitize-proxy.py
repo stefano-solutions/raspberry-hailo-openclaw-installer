@@ -343,17 +343,60 @@ def clean_user_query(text):
 
 
 def should_trigger_web_search(user_message):
-    """Check if user message asks for web research."""
+    """Decide if a message genuinely needs a live web lookup.
+
+    Precision matters far more than recall here: a false positive injects
+    irrelevant search snippets plus a "say you found nothing" instruction,
+    which derails NORMAL tasks (coding, writing, math) on the tiny model.
+
+    Strategy:
+      1. Hard NEGATIVE guard: never web-search creation/coding/translation
+         tasks, even if they happen to contain a stray keyword.
+      2. Require EXPLICIT research intent: either a research phrase
+         ("im internet", "recherche", "suche ... nach") or a current-events /
+         live-data keyword matched on WORD BOUNDARIES (not as a substring).
+    """
     text = str(user_message or "").lower()
-    search_keywords = [
-        "recherch", "internet", "such", "search", "find", "google",
-        "wm", "fifa", "fußball", "fussball", "spielplan", "ergebnis",
-        "today", "heute", "now", "current", "aktuell", "latest", "neu",
-        "2026", "nachrichten", "news", "wetter", "weather",
-        "kosten", "preis", "price", "how much", "wieviel", "wie viel",
-        "was spielt", "wer spielt", "who play", "match", "game",
+    if not text.strip():
+        return False
+
+    # 1) Negative guard: imperative creation / coding / transformation tasks.
+    # These must be answered by the model itself, never grounded on web data.
+    negative_markers = [
+        "schreib", "programmier", "code", "coden", "funktion", "function",
+        "python", "javascript", "java", "bash", "skript", "script",
+        "schleife", "loop", "klasse", "class", "algorithm", "algorithmus",
+        "refactor", "debug", "erklär", "explain", "übersetz", "translate",
+        "fasse zusammen", "summarize", "rechne", "berechne", "calculate",
+        "gedicht", "geschichte", "story", "poem", "essay",
     ]
-    return any(kw in text for kw in search_keywords)
+    if any(m in text for m in negative_markers):
+        return False
+
+    # 2a) Explicit research phrases (strongest signal).
+    research_phrases = [
+        "im internet", "im netz", "online such", "recherch", "google",
+        "such im", "suche im", "such das im", "suche das im", "such nach",
+        "suche nach", "such mir", "such mal", "schau nach", "find heraus",
+        "finde heraus", "search the web", "search online", "look up",
+    ]
+    if any(p in text for p in research_phrases):
+        return True
+
+    # 2b) Current-events / live-data keywords, matched on word boundaries so
+    # "neu" no longer fires on "neue Funktion" and "now" not on "knowledge".
+    live_keywords = [
+        "wm", "fifa", "fußball", "fussball", "spielplan", "ergebnis",
+        "ergebnisse", "today", "heute", "aktuell", "aktuelle", "aktuellen",
+        "latest", "nachrichten", "news", "schlagzeile", "schlagzeilen",
+        "wetter", "weather", "kurs", "preis", "preise", "price", "kosten",
+        "börse", "boerse", "wechselkurs", "wer gewinnt", "wer spielt",
+        "was spielt", "who plays", "live",
+    ]
+    for kw in live_keywords:
+        if re.search(r"\b%s\b" % re.escape(kw), text):
+            return True
+    return False
 
 
 _SEARCH_UA = (
@@ -491,10 +534,15 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
                     last_user_msg = msg.get("content", "")
                     break
             
-            if last_user_msg and should_trigger_web_search(last_user_msg):
-                # Strip channel metadata wrappers so the search query and the
-                # grounding prompt use the actual question, not the JSON blob.
+            if last_user_msg:
+                # Strip channel metadata wrappers FIRST (timestamps, JSON blobs),
+                # then decide on web search. Otherwise the metadata timestamp
+                # ("[Sun 2026-...]") would trigger a search on EVERY message.
                 clean_query = clean_user_query(last_user_msg)
+            else:
+                clean_query = ""
+
+            if clean_query and should_trigger_web_search(clean_query):
                 search_result = perform_web_search(clean_query)
                 if search_result:
                     sys.stderr.write(
