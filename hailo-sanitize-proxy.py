@@ -20,11 +20,14 @@ import http.server
 import json
 import os
 import re
+import html
 import sys
 import time
 import itertools
 import urllib.request
 import urllib.error
+import urllib.parse
+import subprocess
 
 LISTEN_PORT = int(os.environ.get("HAILO_PROXY_PORT", "8081"))
 UPSTREAM = "http://127.0.0.1:8000"
@@ -79,9 +82,25 @@ TRACE_ENABLED = os.environ.get("HAILO_PROXY_TRACE", "1").strip().lower() not in 
 }
 TRACE_DIR = os.environ.get("HAILO_PROXY_TRACE_DIR", "/tmp/hailo-proxy-traces")
 TRACE_MAX_BYTES = _env_int("HAILO_PROXY_TRACE_MAX_BYTES", 250000)
-MAX_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_MAX_TOKENS", 128)
-DEFAULT_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_DEFAULT_TOKENS", 96)
-MAX_HISTORY_MESSAGES = _env_int("HAILO_PROXY_MAX_HISTORY_MESSAGES", 1)
+# TUNING (verified on Pi5 + Hailo 5.3.0, qwen3:1.7b):
+#  - Token caps below are intentionally tight. Benchmarks showed that raising
+#    the cap (e.g. 320/384) makes the 1.7B model run into degenerate repetition
+#    loops and jumps latency from ~12s to 40-66s. 192/128 keeps replies fast & clean.
+#  - frequency_penalty / presence_penalty were tested and HURT this small model
+#    (produced broken loops like 'der Prozyn der Prozyn...'), so they stay unset.
+#  - temperature 0.15 / top_p 0.85 give correct, stable factual answers.
+MAX_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_MAX_TOKENS", 192)
+DEFAULT_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_DEFAULT_TOKENS", 128)
+MAX_HISTORY_MESSAGES = _env_int("HAILO_PROXY_MAX_HISTORY_MESSAGES", 4)
+MAX_MESSAGE_CONTENT_CHARS = _env_int("HAILO_PROXY_MAX_MESSAGE_CHARS", 1200)
+MODEL_TOKEN_CAPS = {
+    "qwen3:1.7b": 192,
+    "qwen2.5-coder:1.5b": 160,
+    "qwen2.5:1.5b": 160,
+    "qwen2:1.5b": 144,
+    "llama3.2:1b": 112,
+    "deepseek_r1:1.5b": 96,
+}
 _TRACE_SEQ = itertools.count(1)
 
 MINIMAL_SYSTEM_PROMPT = (
@@ -102,6 +121,7 @@ ALLOWED_MESSAGE_FIELDS = {
 TOOL_INTENT_TOKENS = (
     " use ", " tool", "skill", "/rag", "rag ", "molt", "run ", "execute"
 )
+MEDIA_ATTACHED_MARKER_RE = re.compile(r"\[media attached:[^\]]+\]", re.IGNORECASE)
 
 # Tools the 1.5B model can't invoke correctly — suppress these.
 # File tools: model generates absolute paths outside sandbox → always fails.
@@ -256,6 +276,11 @@ def _has_explicit_tool_intent(text):
     return any(token in normalized for token in TOOL_INTENT_TOKENS)
 
 
+def model_token_cap(model_id):
+    key = str(model_id or "").strip().lower()
+    return MODEL_TOKEN_CAPS.get(key, MAX_PROXY_COMPLETION_TOKENS)
+
+
 def _write_trace(trace_id, suffix, body_bytes):
     if not TRACE_ENABLED:
         return
@@ -273,6 +298,157 @@ def _write_trace(trace_id, suffix, body_bytes):
     except Exception:
         pass
 
+
+def normalize_message_content(content):
+    """Normalize mixed content so upstream text model won't crash on media markers."""
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                part_type = str(part.get("type", "")).strip().lower()
+                if part_type == "text":
+                    parts.append(str(part.get("text", "")))
+            elif isinstance(part, str):
+                parts.append(part)
+        text = " ".join(p for p in parts if p)
+        text = MEDIA_ATTACHED_MARKER_RE.sub("", text)
+        # Replace newlines with spaces to avoid JSON serialization issues
+        return " ".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+    text = str(content or "")
+    text = MEDIA_ATTACHED_MARKER_RE.sub("", text)
+    # Replace newlines with spaces to avoid JSON serialization issues
+    return " ".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+
+
+def clean_user_query(text):
+    """Recover the real user question from OpenClaw channel-wrapped content.
+
+    Inbound channel messages (Signal, etc.) arrive wrapped with metadata, e.g.
+        [Sun 2026-06-14 13:05 GMT+2] Conversation info (untrusted metadata):
+        ```json { "chat_id": "+49..." } ``` Sender (untrusted metadata):
+        ```json { "name": "Stefan" } ``` Such mir die heutigen WM Spiele raus
+    Feeding that whole blob to Google News returns nothing, so the web-search
+    grounding never fires. Strip the wrappers down to the actual question.
+    """
+    t = str(text or "")
+    # Remove fenced code blocks (```json ... ``` metadata payloads).
+    t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
+    # Remove "... (untrusted metadata):" labels.
+    t = re.sub(r"(?i)\b\w[\w ]*\(untrusted metadata\)\s*:", " ", t)
+    # Remove leading [timestamp] markers like [Sun 2026-06-14 13:05 GMT+2].
+    t = re.sub(r"\[[^\]]*\b\d{4}\b[^\]]*\]", " ", t)
+    # Collapse whitespace.
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or str(text or "").strip()
+
+
+def should_trigger_web_search(user_message):
+    """Check if user message asks for web research."""
+    text = str(user_message or "").lower()
+    search_keywords = [
+        "recherch", "internet", "such", "search", "find", "google",
+        "wm", "fifa", "fußball", "fussball", "spielplan", "ergebnis",
+        "today", "heute", "now", "current", "aktuell", "latest", "neu",
+        "2026", "nachrichten", "news", "wetter", "weather",
+        "kosten", "preis", "price", "how much", "wieviel", "wie viel",
+        "was spielt", "wer spielt", "who play", "match", "game",
+    ]
+    return any(kw in text for kw in search_keywords)
+
+
+_SEARCH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+)
+
+
+def _search_duckduckgo(query):
+    """General web search via the DuckDuckGo Lite endpoint (no API key).
+
+    Returns real result snippets (actual page text) for ANY topic - weather,
+    sports, prices, facts - not just news headlines. The Lite endpoint accepts a
+    POST form and returns plain result rows that are easy to parse and, unlike
+    the JS/html.duckduckgo.com endpoints, does not bot-challenge simple clients.
+    """
+    data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://lite.duckduckgo.com/lite/",
+        data=data,
+        headers={
+            "User-Agent": _SEARCH_UA,
+            "Referer": "https://lite.duckduckgo.com/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        page = response.read().decode("utf-8", "ignore")
+
+    def _clean(raw):
+        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw))).strip()
+
+    titles = [_clean(t) for t in re.findall(r'class=["\']result-link["\'][^>]*>(.*?)</a>', page, re.S)]
+    snippets = [_clean(s) for s in re.findall(r'class=["\']result-snippet["\'][^>]*>(.*?)</td>', page, re.S)]
+
+    items = []
+    for i, snip in enumerate(snippets):
+        if not snip:
+            continue
+        title = titles[i] if i < len(titles) else ""
+        # Title + snippet gives the model both the source label and real facts.
+        entry = ("%s: %s" % (title, snip)).strip(": ") if title else snip
+        if entry and entry not in items:
+            items.append(entry)
+        if len(items) >= 4:
+            break
+    if not items:
+        return None
+    return " | ".join(items)[:700]
+
+
+def _search_google_news(query):
+    """Fallback: Google News RSS headlines (used only if DDG returns nothing)."""
+    url = (
+        "https://news.google.com/rss/search?q="
+        + urllib.parse.quote(query)
+        + "&hl=de&gl=DE&ceid=DE:de"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": _SEARCH_UA})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        xml = response.read().decode("utf-8", "ignore")
+    titles = re.findall(r"<title>(.*?)</title>", xml, re.DOTALL)
+    items = []
+    for raw in titles[1:8]:  # first <title> is the feed name
+        value = html.unescape(re.sub(r"<[^>]+>", " ", raw)).strip()
+        if not value or value.lower() == "google news":
+            continue
+        value = re.sub(r"\s*[-\u2013]\s*[^-\u2013]{2,30}$", "", value).strip()
+        if value and value not in items:
+            items.append(value)
+        if len(items) >= 5:
+            break
+    if not items:
+        return None
+    return " | ".join(items)[:500]
+
+
+def perform_web_search(query):
+    """Run a general web search and return real grounding text for any query.
+
+    Primary source is DuckDuckGo Lite (real result snippets for every topic).
+    Google News RSS is only a fallback when DDG yields nothing. The search must
+    never crash the proxy, so all errors degrade to None.
+    """
+    for source in (_search_duckduckgo, _search_google_news):
+        try:
+            result = source(query)
+            if result:
+                return result
+        except Exception as exc:  # noqa: BLE001 - search must never crash the proxy
+            sys.stderr.write(
+                "hailo-proxy: web search (%s) failed: %s\n" % (source.__name__, exc)
+            )
+            sys.stderr.flush()
+    return None
 
 def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     """Strip unsupported fields from /v1/chat/completions request."""
@@ -302,17 +478,47 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
             if not isinstance(msg, dict):
                 continue
             clean_msg = {k: v for k, v in msg.items() if k in ALLOWED_MESSAGE_FIELDS}
-            if isinstance(clean_msg.get("content"), list):
-                parts = []
-                for part in clean_msg["content"]:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        parts.append(part.get("text", ""))
-                    elif isinstance(part, str):
-                        parts.append(part)
-                clean_msg["content"] = "\n".join(parts)
-            if clean_msg.get("content") is None:
-                clean_msg["content"] = ""
+            clean_msg["content"] = normalize_message_content(clean_msg.get("content"))
             clean_msgs.append(clean_msg)
+        sanitized["messages"] = clean_msgs
+        
+        # Trigger web search if user asks for research
+        web_search_injected = False
+        if clean_msgs:
+            last_user_msg = None
+            for msg in reversed(clean_msgs):
+                if msg.get("role") == "user":
+                    last_user_msg = msg.get("content", "")
+                    break
+            
+            if last_user_msg and should_trigger_web_search(last_user_msg):
+                # Strip channel metadata wrappers so the search query and the
+                # grounding prompt use the actual question, not the JSON blob.
+                clean_query = clean_user_query(last_user_msg)
+                search_result = perform_web_search(clean_query)
+                if search_result:
+                    sys.stderr.write(
+                        "hailo-proxy: web search result: %s\n" % search_result[:120]
+                    )
+                    sys.stderr.flush()
+                    # Inject as a fresh user turn that both supplies the live data
+                    # AND instructs the model to answer from it (the small model
+                    # otherwise replies "can only be looked up online").
+                    grounding = (
+                        "AKTUELLE INTERNET-DATEN (heute abgerufen) zu meiner Frage "
+                        "\"%s\": %s. "
+                        "Beantworte meine Frage in HOECHSTENS 3 kurzen Saetzen, "
+                        "ausschliesslich auf Basis dieser Daten. Nenne nur "
+                        "konkrete Fakten (Namen, Zahlen, Daten) und KEINE "
+                        "Wiederholungen. Erfinde NICHTS: Wenn die Daten die "
+                        "konkrete Antwort NICHT enthalten, sage genau einen Satz: "
+                        "'Dazu finde ich aktuell keine konkreten Angaben.' und fasse "
+                        "danach kurz die relevanten Daten zusammen. Sage NICHT, dass "
+                        "man es online nachschlagen muss."
+                    ) % (clean_query, search_result)
+                    clean_msgs.append({"role": "user", "content": grounding})
+                    web_search_injected = True
+        
         sanitized["messages"] = clean_msgs
 
     sanitized["stream"] = False
@@ -332,11 +538,27 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     if requested_tokens <= 1:
         requested_tokens = DEFAULT_PROXY_COMPLETION_TOKENS
 
-    sanitized["max_tokens"] = min(requested_tokens, MAX_PROXY_COMPLETION_TOKENS)
+    model_id = sanitized.get("model")
+    sanitized["max_tokens"] = min(requested_tokens, model_token_cap(model_id), MAX_PROXY_COMPLETION_TOKENS)
+    # Web-grounded answers: the useful fact is in the first 1-2 sentences. Cap
+    # tighter so the small model stops before it degenerates into number loops
+    # ("1. Halbzeit, 2., 3., ..."). collapse_repetition cleans the rest.
+    if web_search_injected:
+        sanitized["max_tokens"] = min(sanitized["max_tokens"], 96)
     sanitized.pop("max_completion_tokens", None)
 
     if isinstance(sanitized.get("n"), int) and sanitized["n"] > 1:
         sanitized["n"] = 1
+
+    temperature = sanitized.get("temperature")
+    if not isinstance(temperature, (int, float)):
+        temperature = 0.15
+    sanitized["temperature"] = max(0.0, min(float(temperature), 0.6))
+
+    top_p = sanitized.get("top_p")
+    if not isinstance(top_p, (int, float)):
+        top_p = 0.85
+    sanitized["top_p"] = max(0.7, min(float(top_p), 0.95))
 
     if "messages" in sanitized:
         tool_prompt = build_tool_prompt(tools_payload)
@@ -349,12 +571,20 @@ def simplify_messages(messages, tool_prompt=None):
     """Replace OpenClaw's massive system prompt with a minimal one."""
     if not messages:
         return messages
-    # Keep only user messages to avoid confusing the model with orphaned
-    # tool/assistant messages (which cause "I can't help with that" refusals).
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    if len(user_msgs) > MAX_HISTORY_MESSAGES:
-        user_msgs = user_msgs[-MAX_HISTORY_MESSAGES:]
-    other_msgs = user_msgs
+    # Keep compact conversational context (user+assistant), but drop tool frames
+    # that frequently confuse small local models.
+    convo_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+    if len(convo_msgs) > MAX_HISTORY_MESSAGES:
+        convo_msgs = convo_msgs[-MAX_HISTORY_MESSAGES:]
+    # Avoid starting context with an assistant reply that has no user prompt.
+    while convo_msgs and convo_msgs[0].get("role") == "assistant":
+        convo_msgs = convo_msgs[1:]
+    other_msgs = []
+    for msg in convo_msgs:
+        content = str(msg.get("content", ""))
+        if len(content) > MAX_MESSAGE_CONTENT_CHARS:
+            content = content[-MAX_MESSAGE_CONTENT_CHARS:]
+        other_msgs.append({"role": msg.get("role"), "content": content})
     original_sys_msgs = [m.get("content", "") for m in messages if m.get("role") == "system"]
     original_sys_len = sum(len(c) for c in original_sys_msgs)
     if original_sys_len > len(MINIMAL_SYSTEM_PROMPT):
@@ -381,6 +611,11 @@ def simplify_messages(messages, tool_prompt=None):
             f.write(system_content)
     except Exception:
         pass
+    # Hailo constraint: system messages only allowed on first prompt (no continuations)
+    # If other_msgs has history (>1 message), don't include system message
+    is_continuation = len(other_msgs) > 1
+    if is_continuation:
+        return other_msgs
     return [{"role": "system", "content": system_content}] + other_msgs
 
 
@@ -598,6 +833,45 @@ def remap_tool_call(tool_call, latest_user_text, allowed_tool_names):
     return tool_call
 
 
+def collapse_repetition(text):
+    """Remove run-away repeated sentences/phrases from small-model output.
+
+    The 1.x-2B Hailo models frequently degenerate into loops such as
+    "Die Tuerkei spielt heute. Die Tuerkei spielt heute. ...". This collapses
+    consecutive duplicate (or near-duplicate) sentences and immediate phrase
+    repetitions so the user gets a clean answer.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    # Split into sentence-like chunks.
+    parts = re.split(r"(?<=[.!?\n])\s+", text.strip())
+    cleaned = []
+    seen = set()
+    for part in parts:
+        norm = re.sub(r"\s+", " ", part.strip().lower())
+        norm = re.sub(r"[^\w ]", "", norm)
+        if not norm:
+            continue
+        # Drop any sentence already emitted (handles cyclic A B A B loops).
+        if norm in seen:
+            continue
+        seen.add(norm)
+        cleaned.append(part.strip())
+
+    result = " ".join(cleaned)
+
+    # Collapse immediate repeated word groups, tolerating whitespace OR
+    # punctuation separators (e.g. "der DFA der DFA", "die WM, die WM, die WM").
+    result = re.sub(r"(.{3,50}?)(?:[\s,;:.\u2013-]+\1){2,}", r"\1", result)
+    # Collapse runaway enumerations like "M1, M2, M3, ... M28" to first 3 items.
+    enum = re.search(r"((?:[A-Za-z]?\d+,\s*){5,})", result)
+    if enum:
+        head = ", ".join(enum.group(1).split(",")[:3]).strip().rstrip(",")
+        result = result[:enum.start()] + head + " usw." + result[enum.end():]
+    return result.strip()
+
+
 def sanitize_response(
     data,
     allowed_tool_names=None,
@@ -636,6 +910,7 @@ def sanitize_response(
                     latest_user_text=latest_user_text,
                     allowed_tool_names=allowed_tool_names,
                 )
+            content = collapse_repetition(content)
             total_chars += len(content)
             choice["message"] = {
                 "role": msg.get("role", "assistant"),
@@ -1022,7 +1297,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 is_chat = True
         if is_chat and body:
             try:
-                client_wants_stream = json.loads(body).get("stream", False)
+                parsed_request = json.loads(body)
+                client_wants_stream = parsed_request.get("stream", False)
             except Exception:
                 pass
             body = sanitize_chat_body(body, tool_prompt_enabled=allow_tool_calls)

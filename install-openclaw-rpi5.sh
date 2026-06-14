@@ -18,6 +18,7 @@ OPENCLAW_WORKSPACE="$HOME/.openclaw/workspace"
 OPENCLAW_CONFIG="$HOME/.openclaw/openclaw.json"
 MOLTBOOK_CONFIG_DIR="$HOME/.config/moltbook"
 OFFLINE_DIR="$SCRIPT_DIR/offline_bundle"
+HAILO_LOCAL_PACKAGE_DIR="${HAILO_LOCAL_PACKAGE_DIR:-$HOME/Downloads}"
 
 # Keep repeated CLI runs snappy on small hosts and avoid respawn churn.
 export NODE_COMPILE_CACHE="${NODE_COMPILE_CACHE:-/var/tmp/openclaw-compile-cache}"
@@ -32,6 +33,12 @@ USE_SANITIZER_PROXY_ON_OLLAMA=${USE_SANITIZER_PROXY_ON_OLLAMA:-true}
 USE_OPENCLAW_TOOLS=${USE_OPENCLAW_TOOLS:-true}
 CLAW_FLAVOR=${CLAW_FLAVOR:-openclaw}
 UNIFIED_FACADE_HTTP_PORT=${UNIFIED_FACADE_HTTP_PORT:-8787}
+if [[ -z "${OPENCLAW_FIXED_TOKEN:-}" ]]; then
+    # Generate a unique gateway token per install. Avoids shipping a shared
+    # hardcoded credential in the public repo. Override via OPENCLAW_FIXED_TOKEN.
+    OPENCLAW_FIXED_TOKEN="$(head -c 18 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 24)"
+    [[ -z "$OPENCLAW_FIXED_TOKEN" ]] && OPENCLAW_FIXED_TOKEN="openclaw-$(date +%s)"
+fi
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -120,6 +127,151 @@ prompt_input() {
     fi
 }
 
+extract_semver() {
+    printf '%s\n' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+find_latest_local_hailo_artifact() {
+    local search_dir="$1"
+    local pattern="$2"
+    local -a files=()
+    local file
+
+    if [[ ! -d "$search_dir" ]]; then
+        return 1
+    fi
+
+    shopt -s nullglob
+    for file in "$search_dir"/$pattern; do
+        [[ "$file" == *" copy"* ]] && continue
+        files+=("$file")
+    done
+    shopt -u nullglob
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${files[@]}" | sort -V | tail -n 1
+}
+
+detect_required_libhailort() {
+    local hailo_ollama_bin
+    hailo_ollama_bin=$(command -v hailo-ollama 2>/dev/null || true)
+    if [[ -z "$hailo_ollama_bin" ]]; then
+        return 1
+    fi
+
+    ldd "$hailo_ollama_bin" 2>/dev/null | awk '/libhailort\.so/{print $1; exit}'
+}
+
+patch_hailort_pcie_driver_for_kernel() {
+    local monitor_file="/usr/src/hailort-pcie-driver/linux/vdma/monitor.c"
+    if [[ ! -f "$monitor_file" ]]; then
+        return 0
+    fi
+
+    print_step "Applying kernel compatibility patch for hailort-pcie-driver..."
+    sudo python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/usr/src/hailort-pcie-driver/linux/vdma/monitor.c")
+text = path.read_text()
+
+if '#include <linux/version.h>' not in text:
+    text = text.replace('#include "monitor.h"\n', '#include "monitor.h"\n#include <linux/version.h>\n')
+
+if 'timer_delete_sync(&monitor->timer);' not in text and 'del_timer_sync(&monitor->timer);' in text:
+    text = text.replace(
+        '    del_timer_sync(&monitor->timer);',
+        '    #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)\n'
+        '    timer_delete_sync(&monitor->timer);\n'
+        '    #else\n'
+        '    del_timer_sync(&monitor->timer);\n'
+        '    #endif'
+    )
+
+path.write_text(text)
+PY
+}
+
+reset_hailo_pcie_device() {
+    local hailo_pci_addr
+    hailo_pci_addr=$(lspci -Dn | awk '/1e60:45c4/{print $1; exit}')
+
+    if [[ -z "$hailo_pci_addr" ]]; then
+        hailo_pci_addr=$(lspci -Dn | awk '/Hailo/{print $1; exit}')
+    fi
+
+    sudo modprobe -r hailo1x_pci 2>/dev/null || true
+
+    if [[ -n "$hailo_pci_addr" ]] && [[ -e "/sys/bus/pci/devices/${hailo_pci_addr}/reset" ]]; then
+        sudo sh -c "echo 1 > /sys/bus/pci/devices/${hailo_pci_addr}/reset" || true
+    fi
+
+    sleep 1
+    sudo modprobe hailo1x_pci 2>/dev/null || sudo modprobe hailo_pci 2>/dev/null || true
+}
+
+install_local_hailo_stack_from_dir() {
+    local search_dir="$1"
+    local hailort_deb
+    local driver_deb
+    local genai_deb
+    local tappas_core_deb
+    local local_version
+    local -a local_debs=()
+
+    hailort_deb=$(find_latest_local_hailo_artifact "$search_dir" 'hailort_[0-9]*.[0-9]*.[0-9]*_arm64.deb' || true)
+    driver_deb=$(find_latest_local_hailo_artifact "$search_dir" 'hailort-pcie-driver_[0-9]*.[0-9]*.[0-9]*_all.deb' || true)
+    genai_deb=$(find_latest_local_hailo_artifact "$search_dir" 'hailo_gen_ai_model_zoo_[0-9]*.[0-9]*.[0-9]*_arm64.deb' || true)
+    tappas_core_deb=$(find_latest_local_hailo_artifact "$search_dir" 'hailo-tappas-core_[0-9]*.[0-9]*.[0-9]*_arm64.deb' || true)
+
+    if [[ -z "$hailort_deb" || -z "$driver_deb" || -z "$genai_deb" ]]; then
+        return 1
+    fi
+
+    local_version=$(extract_semver "$genai_deb")
+    [[ -z "$local_version" ]] && local_version=$(extract_semver "$hailort_deb")
+
+    print_step "Updating Hailo stack from local packages in $search_dir (target ${local_version:-latest})..."
+    local_debs=("$hailort_deb" "$genai_deb")
+    if [[ -n "$tappas_core_deb" ]]; then
+        local_debs+=("$tappas_core_deb")
+    fi
+
+    sudo apt update
+    sudo apt install -y dkms build-essential
+
+    sudo systemctl stop hailo-ollama.service 2>/dev/null || true
+    sudo systemctl stop hailo-sanitize-proxy.service 2>/dev/null || true
+
+    sudo apt install -y "${local_debs[@]}"
+    sudo apt purge -y h10-hailort-pcie-driver 2>/dev/null || true
+    sudo apt purge -y hailort-pcie-driver 2>/dev/null || true
+    sudo dpkg --unpack "$driver_deb"
+    patch_hailort_pcie_driver_for_kernel
+
+    if ! sudo dpkg --configure hailort-pcie-driver; then
+        print_warn "hailort-pcie-driver configuration failed; falling back to h10-hailort-pcie-driver"
+        sudo apt purge -y hailort-pcie-driver || true
+        sudo apt install -y h10-hailort-pcie-driver || true
+    fi
+
+    sudo apt install -f -y
+    reset_hailo_pcie_device
+
+    if command -v hailortcli &> /dev/null; then
+        if hailortcli scan 2>/dev/null | grep -q "Device:"; then
+            print_step "Hailo device detected by HailoRT after local package update"
+        else
+            print_warn "HailoRT cannot see a device yet. A reboot may be required."
+        fi
+    fi
+
+    print_step "Local Hailo package update complete"
+}
+
 escape_sed_replacement() {
     printf '%s' "$1" | sed -e 's/[\/&\\]/\\&/g'
 }
@@ -137,6 +289,67 @@ ensure_sudo_ready() {
 
     print_step "Requesting sudo credentials..."
     sudo -v
+}
+
+repair_local_cli_pairing_scopes() {
+    local devices_dir="$HOME/.openclaw/devices"
+    local paired_file="$devices_dir/paired.json"
+    local pending_file="$devices_dir/pending.json"
+
+    if [[ ! -f "$paired_file" ]]; then
+        return
+    fi
+
+    print_step "Repairing local OpenClaw CLI pairing scopes..."
+    python3 - <<'PY'
+import json, os, shutil, time
+
+devices_dir = os.path.expanduser("~/.openclaw/devices")
+paired_file = os.path.join(devices_dir, "paired.json")
+pending_file = os.path.join(devices_dir, "pending.json")
+full_scopes = [
+    "operator.admin",
+    "operator.read",
+    "operator.write",
+    "operator.approvals",
+    "operator.pairing",
+]
+
+def backup(path):
+    if os.path.exists(path):
+        shutil.copy2(path, f"{path}.bak.{int(time.time())}")
+
+backup(paired_file)
+backup(pending_file)
+
+with open(paired_file, "r", encoding="utf-8") as f:
+    paired = json.load(f)
+
+changed = False
+for _, entry in list(paired.items()):
+    if not isinstance(entry, dict):
+        continue
+    if entry.get("clientId") != "cli" or entry.get("clientMode") != "cli":
+        continue
+    if entry.get("scopes") != full_scopes:
+        entry["scopes"] = full_scopes[:]
+        changed = True
+    if entry.get("approvedScopes") != full_scopes:
+        entry["approvedScopes"] = full_scopes[:]
+        changed = True
+    tokens = entry.get("tokens")
+    if isinstance(tokens, dict) and isinstance(tokens.get("operator"), dict):
+        if tokens["operator"].get("scopes") != full_scopes:
+            tokens["operator"]["scopes"] = full_scopes[:]
+            changed = True
+
+if changed:
+    with open(paired_file, "w", encoding="utf-8") as f:
+        json.dump(paired, f, indent=2)
+
+with open(pending_file, "w", encoding="utf-8") as f:
+    json.dump({}, f, indent=2)
+PY
 }
 
 normalize_claw_flavor() {
@@ -373,6 +586,12 @@ ensure_homebrew() {
 
     print_warn "Homebrew (brew) not found"
 
+    if [[ "$NON_INTERACTIVE" == "true" || ! -t 0 ]]; then
+        print_warn "Non-interactive mode enabled - skipping Homebrew install"
+        print_warn "If a command later requires brew, run the installer interactively once to bootstrap it."
+        return 0
+    fi
+
     if [[ "$OFFLINE_MODE" == "true" ]]; then
         print_warn "Offline mode enabled - skipping Homebrew install"
         print_warn "If OpenClaw fails due to missing brew, re-run with internet access"
@@ -404,7 +623,8 @@ ensure_homebrew() {
 #===============================================================================
 
 build_hailort_from_source() {
-    local HAILORT_VERSION="${1:-v5.1.1}"
+    local HAILORT_VERSION="${1:-v5.3.0}"
+    local HAILORT_SEMVER="${HAILORT_VERSION#v}"
     
     print_header "Building HailoRT $HAILORT_VERSION from source"
     print_warn "This is required because hailo-ollama needs a newer libhailort version."
@@ -442,7 +662,7 @@ build_hailort_from_source() {
     sudo ldconfig
     
     # Verify
-    if [[ -f /usr/local/lib/libhailort.so ]] || [[ -f /usr/lib/libhailort.so.5.1.1 ]]; then
+    if [[ -f /usr/local/lib/libhailort.so ]] || [[ -f "/usr/lib/libhailort.so.${HAILORT_SEMVER}" ]] || [[ -f "/usr/local/lib/libhailort.so.${HAILORT_SEMVER}" ]]; then
         print_step "HailoRT $HAILORT_VERSION built and installed successfully"
         return 0
     else
@@ -529,13 +749,14 @@ prepare_offline_bundle() {
     
     echo "Available Hailo-optimized models:"
     echo ""
-    echo "  1) qwen2:1.5b        - General purpose (recommended)"
-    echo "  2) qwen2.5:1.5b      - Improved general purpose"
-    echo "  3) qwen2.5-coder:1.5b - Optimized for coding"
-    echo "  4) llama3.2:1b       - Meta's compact model"
-    echo "  5) deepseek_r1:1.5b  - Reasoning-focused model"
-    echo "  6) All models        - Download all available models"
-    echo "  7) Skip              - Don't download any models"
+    echo "  1) qwen3:1.7b               - Newest model in GenAI 5.3.0 (recommended)"
+    echo "  2) qwen2.5-coder:1.5b       - Optimized for coding"
+    echo "  3) qwen2.5:1.5b             - Improved general purpose"
+    echo "  4) qwen2:1.5b               - General purpose"
+    echo "  5) llama3.2:1b              - Meta's compact model"
+    echo "  6) deepseek_r1:1.5b         - Reasoning-focused model"
+    echo "  7) All models               - Download all available models"
+    echo "  8) Skip                     - Don't download any models"
     echo ""
     
     MODEL_CHOICE=$(prompt_input "Select model to bundle" "1")
@@ -543,14 +764,15 @@ prepare_offline_bundle() {
     mkdir -p hailo_models
     
     case $MODEL_CHOICE in
-        1) MODELS_TO_DOWNLOAD="qwen2:1.5b" ;;
-        2) MODELS_TO_DOWNLOAD="qwen2.5:1.5b" ;;
-        3) MODELS_TO_DOWNLOAD="qwen2.5-coder:1.5b" ;;
-        4) MODELS_TO_DOWNLOAD="llama3.2:1b" ;;
-        5) MODELS_TO_DOWNLOAD="deepseek_r1:1.5b" ;;
-        6) MODELS_TO_DOWNLOAD="qwen2:1.5b qwen2.5:1.5b qwen2.5-coder:1.5b llama3.2:1b deepseek_r1:1.5b" ;;
-        7) MODELS_TO_DOWNLOAD="" ;;
-        *) MODELS_TO_DOWNLOAD="qwen2:1.5b" ;;
+        1) MODELS_TO_DOWNLOAD="qwen3:1.7b" ;;
+        2) MODELS_TO_DOWNLOAD="qwen2.5-coder:1.5b" ;;
+        3) MODELS_TO_DOWNLOAD="qwen2.5:1.5b" ;;
+        4) MODELS_TO_DOWNLOAD="qwen2:1.5b" ;;
+        5) MODELS_TO_DOWNLOAD="llama3.2:1b" ;;
+        6) MODELS_TO_DOWNLOAD="deepseek_r1:1.5b" ;;
+        7) MODELS_TO_DOWNLOAD="qwen3:1.7b qwen2.5-coder:1.5b qwen2.5:1.5b qwen2:1.5b llama3.2:1b deepseek_r1:1.5b" ;;
+        8) MODELS_TO_DOWNLOAD="" ;;
+        *) MODELS_TO_DOWNLOAD="qwen3:1.7b" ;;
     esac
     
     # Ask about RAG embedding model
@@ -751,6 +973,11 @@ phase1_system_prep_offline() {
 
 phase2_hailo_setup() {
     print_header "Phase 2: Hailo AI HAT+ 2 Setup (Hailo-10H GenAI)"
+    local REQUIRED_LIB
+    local REQUIRED_HAILORT_VERSION
+    local HAILORT_BUILD_TAG
+    local BUILT_LIB=""
+    local LOCAL_HAILO_STACK_UPDATED=false
     
     # Step 1: Check if Hailo-10H is detected via PCIe
     print_step "Checking for Hailo AI HAT+ 2 hardware..."
@@ -772,30 +999,41 @@ phase2_hailo_setup() {
         print_step "Hailo device detected: $(lspci | grep -i Hailo)"
     fi
     
-    # Step 2: Install Hailo software stack if not present
-    if ! command -v hailortcli &> /dev/null; then
-        print_step "Installing Hailo software stack..."
-        
-        if [[ "$OFFLINE_MODE" == "true" ]]; then
-            # Offline: Install from bundled .deb packages
-            if compgen -G "$OFFLINE_DIR/hailo_debs/hailo-h10-all*.deb" > /dev/null; then
-                sudo dpkg -i "$OFFLINE_DIR/hailo_debs/"*.deb || sudo apt-get install -f -y
+    # Step 2: Install/update Hailo software stack
+    if [[ "$OFFLINE_MODE" != "true" ]]; then
+        if install_local_hailo_stack_from_dir "$HAILO_LOCAL_PACKAGE_DIR"; then
+            LOCAL_HAILO_STACK_UPDATED=true
+        else
+            print_warn "No complete local Hailo package set found in $HAILO_LOCAL_PACKAGE_DIR."
+            print_warn "Expected at least: hailort_*.deb, hailort-pcie-driver_*.deb, hailo_gen_ai_model_zoo_*.deb"
+        fi
+    fi
+
+    if [[ "$LOCAL_HAILO_STACK_UPDATED" != "true" ]]; then
+        if ! command -v hailortcli &> /dev/null; then
+            print_step "Installing Hailo software stack..."
+            
+            if [[ "$OFFLINE_MODE" == "true" ]]; then
+                # Offline: Install from bundled .deb packages
+                if compgen -G "$OFFLINE_DIR/hailo_debs/hailo-h10-all*.deb" > /dev/null; then
+                    sudo dpkg -i "$OFFLINE_DIR/hailo_debs/"*.deb || sudo apt-get install -f -y
+                else
+                    print_warn "Hailo-10H packages not found in offline bundle."
+                    print_warn "You will need to install manually when internet is available."
+                fi
             else
-                print_warn "Hailo-10H packages not found in offline bundle."
-                print_warn "You will need to install manually when internet is available."
+                # Online fallback: Install via apt (Raspberry Pi's official method)
+                # IMPORTANT: Use hailo-h10-all for Hailo-10H (AI HAT+ 2), NOT hailo-all.
+                # hailo-all is for Hailo-8/8L and installs a PCIe driver (4.23.0) that
+                # doesn't support Hailo-10H, causing "Failed to create VDevice" errors.
+                print_step "Installing hailo-h10-all package (HailoRT for Hailo-10H)..."
+                sudo apt update
+                sudo apt install -y dkms
+                sudo apt install -y hailo-h10-all
             fi
         else
-            # Online: Install via apt (Raspberry Pi's official method)
-            # IMPORTANT: Use hailo-h10-all for Hailo-10H (AI HAT+ 2), NOT hailo-all.
-            # hailo-all is for Hailo-8/8L and installs a PCIe driver (4.23.0) that
-            # doesn't support Hailo-10H, causing "Failed to create VDevice" errors.
-            print_step "Installing hailo-h10-all package (HailoRT for Hailo-10H)..."
-            sudo apt update
-            sudo apt install -y dkms
-            sudo apt install -y hailo-h10-all
+            print_step "HailoRT already installed"
         fi
-    else
-        print_step "HailoRT already installed"
     fi
     
     # Step 3: Ensure Hailo kernel module autoload is configured and module is loaded now.
@@ -815,15 +1053,19 @@ phase2_hailo_setup() {
             print_step "hailo_pci added to /etc/modules-load.d/ for boot autoload"
         fi
     fi
-    # Wait briefly for /dev/hailo0 to appear
+    # Wait briefly for a Hailo device node to appear
     for i in $(seq 1 5); do
-        [[ -e /dev/hailo0 ]] && break
+        [[ -e /dev/hailo0 || -e /dev/h1x-0 ]] && break
         sleep 1
     done
-    if [[ ! -e /dev/hailo0 ]]; then
-        print_warn "/dev/hailo0 not found — Hailo device may not be accessible"
+    if [[ ! -e /dev/hailo0 && ! -e /dev/h1x-0 ]]; then
+        print_warn "No /dev/hailo0 or /dev/h1x-0 device node found — Hailo device may not be accessible"
     else
-        print_step "/dev/hailo0 present"
+        if [[ -e /dev/h1x-0 ]]; then
+            print_step "/dev/h1x-0 present"
+        else
+            print_step "/dev/hailo0 present"
+        fi
     fi
     
     # Step 3b: Verify HailoRT installation
@@ -869,7 +1111,7 @@ phase2_hailo_setup() {
                 echo ""
                 echo "Please download manually from Hailo Developer Zone:"
                 echo "  1. Go to: https://hailo.ai/developer-zone/software-downloads/"
-                echo "  2. Download: hailo_gen_ai_model_zoo_5.1.1_arm64.deb (or latest)"
+                echo "  2. Download: hailo_gen_ai_model_zoo_5.3.0_arm64.deb (or latest)"
                 echo "  3. Install: sudo dpkg -i hailo_gen_ai_model_zoo_*.deb"
                 echo ""
                 
@@ -895,14 +1137,24 @@ phase2_hailo_setup() {
     fi
     
     # Step 5: Check if libhailort version matches hailo-ollama requirements
-    # hailo-ollama from GenAI Model Zoo 5.1.1 requires libhailort.so.5.1.1
     print_step "Checking libhailort version compatibility..."
     
-    REQUIRED_LIB="libhailort.so.5.1.1"
+    REQUIRED_LIB=$(detect_required_libhailort || true)
+    if [[ -z "$REQUIRED_LIB" ]]; then
+        REQUIRED_LIB="libhailort.so.5.3.0"
+    fi
+    REQUIRED_HAILORT_VERSION=$(extract_semver "$REQUIRED_LIB")
+    if [[ -n "$REQUIRED_HAILORT_VERSION" ]]; then
+        HAILORT_BUILD_TAG="v${REQUIRED_HAILORT_VERSION}"
+    else
+        HAILORT_BUILD_TAG="v5.3.0"
+    fi
+
     if ! ldconfig -p | grep -q "$REQUIRED_LIB" && \
        ! [[ -f /usr/lib/$REQUIRED_LIB ]] && \
-       ! [[ -f /usr/local/lib/$REQUIRED_LIB ]]; then
-        print_warn "Required $REQUIRED_LIB not found (hailo-ollama needs HailoRT 5.1.1)"
+       ! [[ -f /usr/local/lib/$REQUIRED_LIB ]] && \
+       ! [[ -f /usr/lib/aarch64-linux-gnu/$REQUIRED_LIB ]]; then
+        print_warn "Required $REQUIRED_LIB not found (hailo-ollama dependency)"
         echo ""
         echo "The apt version of HailoRT may be incompatible with hailo-ollama."
         echo "Building HailoRT from source to fix this..."
@@ -914,47 +1166,70 @@ phase2_hailo_setup() {
             return
         fi
         
-        if build_hailort_from_source "v5.1.1"; then
+        if build_hailort_from_source "$HAILORT_BUILD_TAG"; then
             # Update symlinks to point to new library
             print_step "Updating library symlinks..."
             sudo rm -f /usr/lib/libhailort.so 2>/dev/null || true
-            if [[ -f /usr/local/lib/libhailort.so.5.1.1 ]]; then
-                sudo ln -sf /usr/local/lib/libhailort.so.5.1.1 /usr/lib/libhailort.so
-                sudo ln -sf /usr/local/lib/libhailort.so.5.1.1 /usr/lib/libhailort.so.5.1.1
+
+            for candidate in \
+                "/usr/local/lib/$REQUIRED_LIB" \
+                "/usr/local/lib/libhailort.so.${REQUIRED_HAILORT_VERSION}" \
+                "/usr/local/lib/libhailort.so"; do
+                if [[ -f "$candidate" ]]; then
+                    BUILT_LIB="$candidate"
+                    break
+                fi
+            done
+
+            if [[ -n "$BUILT_LIB" ]]; then
+                sudo ln -sf "$BUILT_LIB" /usr/lib/libhailort.so
+                sudo ln -sf "$BUILT_LIB" "/usr/lib/$REQUIRED_LIB"
                 echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/hailort.conf > /dev/null
             fi
             sudo ldconfig
-            print_step "HailoRT 5.1.1 installed and configured"
+            print_step "HailoRT ${REQUIRED_HAILORT_VERSION:-$HAILORT_BUILD_TAG} installed and configured"
         else
             print_error "Failed to build HailoRT from source"
             return
         fi
     else
-        print_step "libhailort 5.1.1 found - compatible with hailo-ollama"
+        print_step "$REQUIRED_LIB found - compatible with hailo-ollama"
     fi
     
+    # Benchmarked on Pi5 + Hailo 5.3.0: qwen3:1.7b is fastest (~12s) AND most
+    # coherent of the bundled models, so it is the recommended/primary default.
+    # Proxy token caps (192/128) and unset penalties were verified optimal -
+    # see tuning notes in hailo-sanitize-proxy.py. Do not raise caps for 1.x B models.
     # Prompt user to select model
     echo "Available Hailo-optimized models:"
     echo ""
-    echo "  1) qwen2:1.5b        - General purpose (recommended)"
-    echo "  2) qwen2.5:1.5b      - Improved general purpose"
-    echo "  3) qwen2.5-coder:1.5b - Optimized for coding"
-    echo "  4) llama3.2:1b       - Meta's compact model"
-    echo "  5) deepseek_r1:1.5b  - Reasoning-focused model"
+    echo "  1) qwen3:1.7b               - Newest model in GenAI 5.3.0 (recommended)"
+    echo "  2) qwen2.5-coder:1.5b       - Optimized for coding"
+    echo "  3) qwen2.5:1.5b             - Improved general purpose"
+    echo "  4) qwen2:1.5b               - General purpose"
+    echo "  5) llama3.2:1b              - Meta's compact model"
+    echo "  6) deepseek_r1:1.5b         - Reasoning-focused model"
+    echo "  7) All available models     - Install all currently supported models"
     echo ""
     
     MODEL_CHOICE=$(prompt_input "Select model" "1")
     
     case $MODEL_CHOICE in
-        1) SELECTED_MODEL="qwen2:1.5b" ;;
-        2) SELECTED_MODEL="qwen2.5:1.5b" ;;
-        3) SELECTED_MODEL="qwen2.5-coder:1.5b" ;;
-        4) SELECTED_MODEL="llama3.2:1b" ;;
-        5) SELECTED_MODEL="deepseek_r1:1.5b" ;;
-        *) SELECTED_MODEL="qwen2:1.5b" ;;
+        1) SELECTED_MODEL="qwen3:1.7b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
+        2) SELECTED_MODEL="qwen2.5-coder:1.5b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
+        3) SELECTED_MODEL="qwen2.5:1.5b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
+        4) SELECTED_MODEL="qwen2:1.5b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
+        5) SELECTED_MODEL="llama3.2:1b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
+        6) SELECTED_MODEL="deepseek_r1:1.5b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
+        7)
+            SELECTED_MODEL="qwen3:1.7b"
+            SELECTED_MODELS="qwen3:1.7b qwen2.5-coder:1.5b qwen2.5:1.5b qwen2:1.5b llama3.2:1b deepseek_r1:1.5b"
+            ;;
+        *) SELECTED_MODEL="qwen3:1.7b"; SELECTED_MODELS="$SELECTED_MODEL" ;;
     esac
     
-    print_step "Selected model: $SELECTED_MODEL"
+    print_step "Selected primary model: $SELECTED_MODEL"
+    print_step "Models to install: $SELECTED_MODELS"
     
     # Step 6: Disable hailort_service if running (conflicts with hailo-ollama on Hailo-10H)
     # hailort_service is a multi-process RPC daemon for Hailo-8/8L. On Hailo-10H,
@@ -1016,53 +1291,56 @@ EOF
     fi
     
     if [[ "$OFFLINE_MODE" == "true" ]]; then
-        # Check if model exists in offline bundle
-        MODEL_DIR_NAME="${SELECTED_MODEL//:/\/}"  # Convert qwen2:1.5b to qwen2/1.5b
-        if [[ -d "$OFFLINE_DIR/hailo_models/$MODEL_DIR_NAME" ]]; then
-            print_step "Installing $SELECTED_MODEL from offline bundle..."
-            mkdir -p ~/.hailo-ollama/models
-            cp -r "$OFFLINE_DIR/hailo_models/$MODEL_DIR_NAME" ~/.hailo-ollama/models/ 2>/dev/null || true
-            print_step "Model installed from offline bundle"
-        else
-            print_warn "Model $SELECTED_MODEL not found in offline bundle."
-            print_warn "Available models in bundle:"
-            ls -la "$OFFLINE_DIR/hailo_models/" 2>/dev/null || echo "  (none)"
-            print_warn "You will need to download the model when internet is available:"
-            echo "  hailo-ollama pull $SELECTED_MODEL"
-        fi
+        for model in $SELECTED_MODELS; do
+            MODEL_DIR_NAME="${model//:/\/}"  # Convert qwen2:1.5b to qwen2/1.5b
+            if [[ -d "$OFFLINE_DIR/hailo_models/$MODEL_DIR_NAME" ]]; then
+                print_step "Installing $model from offline bundle..."
+                mkdir -p ~/.hailo-ollama/models
+                cp -r "$OFFLINE_DIR/hailo_models/$MODEL_DIR_NAME" ~/.hailo-ollama/models/ 2>/dev/null || true
+                print_step "Model $model installed from offline bundle"
+            else
+                print_warn "Model $model not found in offline bundle."
+                print_warn "Available models in bundle:"
+                ls -la "$OFFLINE_DIR/hailo_models/" 2>/dev/null || echo "  (none)"
+                print_warn "You will need to download this model when internet is available:"
+                echo "  hailo-ollama pull $model"
+            fi
+        done
     else
-        print_step "Pulling $SELECTED_MODEL model (this may take several minutes)..."
-        echo ""
-        
-        # Use a temp file to capture output while showing progress
-        PULL_OUTPUT=$(mktemp)
-        
-        # Run curl and tee output to both terminal and file
-        if curl -s http://localhost:8000/api/pull \
-            -H 'Content-Type: application/json' \
-            -d "{\"model\":\"$SELECTED_MODEL\",\"stream\":true}" 2>&1 | tee "$PULL_OUTPUT"; then
-            
-            # Check if output contains error indicators
-            if grep -qi "error\|500\|failed\|not found" "$PULL_OUTPUT"; then
-                echo ""
-                print_error "Model pull encountered an error"
-                print_warn "You may need to pull it manually later:"
-                echo "  curl http://localhost:8000/api/pull -H 'Content-Type: application/json' -d '{\"model\":\"$SELECTED_MODEL\",\"stream\":true}'"
-            elif [[ ! -s "$PULL_OUTPUT" ]]; then
-                echo ""
-                print_error "No response from hailo-ollama server"
-                print_warn "Check if hailo-ollama is running: ps aux | grep hailo-ollama"
+        for model in $SELECTED_MODELS; do
+            print_step "Pulling $model (this may take several minutes)..."
+            echo ""
+
+            # Use a temp file to capture output while showing progress
+            PULL_OUTPUT=$(mktemp)
+
+            # Run curl and tee output to both terminal and file
+            if curl -s http://localhost:8000/api/pull \
+                -H 'Content-Type: application/json' \
+                -d "{\"model\":\"$model\",\"stream\":true}" 2>&1 | tee "$PULL_OUTPUT"; then
+
+                # Check if output contains error indicators
+                if grep -qi "error\|500\|failed\|not found" "$PULL_OUTPUT"; then
+                    echo ""
+                    print_error "Model pull for $model encountered an error"
+                    print_warn "You may need to pull it manually later:"
+                    echo "  curl http://localhost:8000/api/pull -H 'Content-Type: application/json' -d '{\"model\":\"$model\",\"stream\":true}'"
+                elif [[ ! -s "$PULL_OUTPUT" ]]; then
+                    echo ""
+                    print_error "No response from hailo-ollama server while pulling $model"
+                    print_warn "Check if hailo-ollama is running: ps aux | grep hailo-ollama"
+                else
+                    echo ""
+                    print_step "Model $model pulled successfully"
+                fi
             else
                 echo ""
-                print_step "Model $SELECTED_MODEL pulled successfully"
+                print_error "curl command failed while pulling $model"
+                print_warn "Check network connectivity and hailo-ollama server status"
             fi
-        else
-            echo ""
-            print_error "curl command failed"
-            print_warn "Check network connectivity and hailo-ollama server status"
-        fi
-        
-        rm -f "$PULL_OUTPUT"
+
+            rm -f "$PULL_OUTPUT"
+        done
     fi
     
     # Store selected model for later use in config
@@ -1196,8 +1474,7 @@ phase3_openclaw_install() {
     
     # Use explicit provider config with /v1/chat/completions via sanitizing proxy.
     # The proxy (port 8081) sits between OpenClaw and hailo-ollama (port 8000).
-    # We set contextWindow to 16000 to satisfy OpenClaw's minimum requirement
-    # (real context is 2048, maxTokens caps actual generation).
+    # Conservative context/token limits for stable Hailo generation across models.
     if [[ "$USE_OPENCLAW_TOOLS" == "true" ]]; then
         TOOLS_BLOCK=""
     else
@@ -1207,12 +1484,32 @@ phase3_openclaw_install() {
         print_warn "OpenClaw tools disabled (USE_OPENCLAW_TOOLS=false)"
     fi
 
+    if [[ -z "${OPENCLAW_FIXED_TOKEN:-}" ]]; then
+        OPENCLAW_FIXED_TOKEN="$(head -c 18 /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c 24)"
+        [[ -z "$OPENCLAW_FIXED_TOKEN" ]] && OPENCLAW_FIXED_TOKEN="openclaw-$(date +%s)"
+    fi
+
+
+    # Determine Tailscale IP for allowedOrigins
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -1 || echo "")
+
     cat > "$OPENCLAW_CONFIG" << EOF
 {
   "gateway": {
     "mode": "local",
+    "bind": "tailnet",
+    "controlUi": {
+      "allowInsecureAuth": true,
+      "allowedOrigins": [
+        "http://localhost:${OPENCLAW_PORT}",
+        "http://127.0.0.1:${OPENCLAW_PORT}"$([ -n "$ts_ip" ] && echo ",
+        \"http://${ts_ip}:${OPENCLAW_PORT}\"")
+      ]
+    },
     "auth": {
-      "mode": "none"
+      "mode": "token",
+      "token": "$OPENCLAW_FIXED_TOKEN"
     }
   },
   "models": {
@@ -1223,13 +1520,58 @@ phase3_openclaw_install() {
         "api": "openai-completions",
         "models": [
           {
-            "id": "$MODEL_ID",
-            "name": "$MODEL_ID",
+            "id": "qwen3:1.7b",
+            "name": "qwen3:1.7b",
             "reasoning": false,
             "input": ["text"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 16000,
-            "maxTokens": 2048
+            "contextWindow": 32768,
+            "maxTokens": 192
+          },
+          {
+            "id": "qwen2.5-coder:1.5b",
+            "name": "qwen2.5-coder:1.5b",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 192
+          },
+          {
+            "id": "qwen2.5:1.5b",
+            "name": "qwen2.5:1.5b",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 192
+          },
+          {
+            "id": "qwen2:1.5b",
+            "name": "qwen2:1.5b",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 192
+          },
+          {
+            "id": "llama3.2:1b",
+            "name": "llama3.2:1b",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 192
+          },
+          {
+            "id": "deepseek_r1:1.5b",
+            "name": "deepseek_r1:1.5b",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 32768,
+            "maxTokens": 192
           }
         ]
       }
@@ -1241,7 +1583,22 @@ phase3_openclaw_install() {
         "primary": "$HAILO_PROVIDER_MODEL"
       },
       "models": {
-        "$HAILO_PROVIDER_MODEL": {
+        "'"$HAILO_PROVIDER_ID"'/qwen3:1.7b": {
+          "streaming": false
+        },
+        "'"$HAILO_PROVIDER_ID"'/qwen2.5-coder:1.5b": {
+          "streaming": false
+        },
+        "'"$HAILO_PROVIDER_ID"'/qwen2.5:1.5b": {
+          "streaming": false
+        },
+        "'"$HAILO_PROVIDER_ID"'/qwen2:1.5b": {
+          "streaming": false
+        },
+        "'"$HAILO_PROVIDER_ID"'/llama3.2:1b": {
+          "streaming": false
+        },
+        "'"$HAILO_PROVIDER_ID"'/deepseek_r1:1.5b": {
           "streaming": false
         }
       },
@@ -1259,13 +1616,13 @@ phase3_openclaw_install() {
       "bootstrapTotalMaxChars": 12000,
       "compaction": {
         "reserveTokens": 2048,
-        "reserveTokensFloor": 3000
+        "reserveTokensFloor": 20000
       }
     }
   },
   $TOOLS_BLOCK
   "plugins": {
-    "allow": ["nextcloud-talk"],
+    "allow": ["nextcloud-talk", "duckduckgo", "web-readability"],
     "bundledDiscovery": "compat"
   }
 }
@@ -1304,6 +1661,7 @@ EOF
     sed -i '/OPENCLAW_GATEWAY_TOKEN/d' "$HOME/.bashrc" 2>/dev/null || true
     mkdir -p "$HOME/.openclaw"
     cat > "$HOME/.openclaw/.env" << EOF
+OPENCLAW_GATEWAY_TOKEN=$OPENCLAW_FIXED_TOKEN
 NODE_COMPILE_CACHE=$NODE_COMPILE_CACHE
 OPENCLAW_NO_RESPAWN=$OPENCLAW_NO_RESPAWN
 EOF
@@ -1314,6 +1672,8 @@ EOF
     openclaw daemon restart 2>/dev/null || openclaw gateway restart 2>/dev/null || {
         print_warn "Could not restart daemon automatically — restart manually after install"
     }
+    repair_local_cli_pairing_scopes
+    openclaw gateway restart 2>/dev/null || true
 }
 
 phase3_picoclaw_install() {
@@ -1777,6 +2137,118 @@ phase4_deploy_config() {
     fi
 }
 
+ensure_openclaw_boot_autostart() {
+    print_header "Ensuring Boot Autostart"
+
+    # Keep user services alive and auto-starting even without interactive login.
+    sudo loginctl enable-linger "$USER" || print_warn "Could not enable linger for $USER"
+
+    # System services should start automatically after reboot/powercycle.
+    sudo systemctl enable hailo-ollama.service 2>/dev/null || true
+    sudo systemctl enable hailo-sanitize-proxy.service 2>/dev/null || true
+    sudo systemctl enable unified-chat-facade.service 2>/dev/null || true
+
+    # OpenClaw gateway is a user service; with linger it can boot without login.
+    # Force explicit --bind tailnet in the unit to avoid fallback to loopback.
+    local gateway_unit="$HOME/.config/systemd/user/openclaw-gateway.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user list-unit-files 2>/dev/null | grep -q '^openclaw-gateway.service'; then
+        systemctl --user enable openclaw-gateway.service 2>/dev/null || print_warn "Could not enable openclaw-gateway user service"
+        systemctl --user restart openclaw-gateway.service 2>/dev/null || print_warn "Could not restart openclaw-gateway user service"
+    else
+        print_warn "openclaw-gateway.service not found yet; trying to create/start it via CLI"
+        openclaw gateway restart 2>/dev/null || true
+        if systemctl --user list-unit-files 2>/dev/null | grep -q '^openclaw-gateway.service'; then
+            systemctl --user enable openclaw-gateway.service 2>/dev/null || true
+            systemctl --user restart openclaw-gateway.service 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -f "$gateway_unit" ]]; then
+        # Ensure --bind tailnet flag is present in ExecStart
+        if grep -q ' gateway --port 18789$' "$gateway_unit"; then
+            sed -i 's| gateway --port 18789$| gateway --port 18789 --bind tailnet|' "$gateway_unit"
+        elif grep -q ' gateway --port 18789 ' "$gateway_unit" && ! grep -q -- '--bind' "$gateway_unit"; then
+            sed -i 's| gateway --port 18789 | gateway --port 18789 --bind tailnet |' "$gateway_unit"
+        fi
+
+        # Add ExecStartPre to wait for Tailscale IP (fixes race condition on boot)
+        if ! grep -q 'ExecStartPre' "$gateway_unit"; then
+            sed -i '/^ExecStart=/i ExecStartPre=/bin/sh -c '"'"'for i in $(seq 1 60); do tailscale ip -4 2>/dev/null | grep -q "^[0-9]" \&\& exit 0 || sleep 2; done; exit 1'"'"'' "$gateway_unit"
+        fi
+
+        # Increase TimeoutStartSec to accommodate the wait loop (max 120s wait + margin)
+        sed -i 's/^TimeoutStartSec=.*/TimeoutStartSec=150/' "$gateway_unit"
+
+        systemctl --user daemon-reload 2>/dev/null || true
+        systemctl --user restart openclaw-gateway.service 2>/dev/null || true
+    fi
+
+    # Configure browser origins and HTTPS access for remote Control UI.
+    local ts_ip ts_dns origins_json
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -1 || echo "")
+    ts_dns=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("Self",{}).get("DNSName","")).rstrip("."))' 2>/dev/null || echo "")
+
+    origins_json="[\"http://localhost:${OPENCLAW_PORT}\",\"http://127.0.0.1:${OPENCLAW_PORT}\""
+    if [[ -n "$ts_ip" ]]; then
+        origins_json="${origins_json},\"http://${ts_ip}:${OPENCLAW_PORT}\""
+    fi
+    if [[ -n "$ts_dns" ]]; then
+        origins_json="${origins_json},\"https://${ts_dns}\""
+    fi
+    origins_json="${origins_json}]"
+
+    openclaw config set gateway.controlUi.allowedOrigins "$origins_json" 2>/dev/null || true
+    print_step "Applied gateway.controlUi.allowedOrigins for localhost + tailnet"
+
+    # Keep model labels stable in UI even when VL alias fallback is active.
+    if [[ -f "$OPENCLAW_CONFIG" ]]; then
+        python3 - <<'PY' "$OPENCLAW_CONFIG"
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        d = json.load(f)
+except Exception:
+    raise SystemExit(0)
+providers = d.get("models", {}).get("providers", {})
+hailo = providers.get("hailo")
+changed = False
+expected_names = {
+    "qwen3:1.7b": "qwen3:1.7b",
+    "qwen2.5-coder:1.5b": "qwen2.5-coder:1.5b",
+    "qwen2.5:1.5b": "qwen2.5:1.5b",
+    "qwen2:1.5b": "qwen2:1.5b",
+    "llama3.2:1b": "llama3.2:1b",
+    "deepseek_r1:1.5b": "deepseek_r1:1.5b",
+}
+if isinstance(hailo, dict):
+    for m in hailo.get("models", []) or []:
+        mid = m.get("id")
+        expected = expected_names.get(mid)
+        if expected and m.get("name") != expected:
+            m["name"] = expected
+            changed = True
+if changed:
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+PY
+    fi
+
+    # Expose OpenClaw over HTTPS on MagicDNS (secure browser context).
+    if [[ -n "$ts_ip" ]]; then
+        sudo tailscale serve --bg "http://${ts_ip}:${OPENCLAW_PORT}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" == "yes" ]]; then
+        print_step "Linger enabled for $USER"
+    else
+        print_warn "Linger not confirmed for $USER"
+    fi
+    print_step "Boot autostart configuration applied"
+}
+
 #===============================================================================
 # Phase 5: Deploy molt_tools Skill
 #===============================================================================
@@ -1891,15 +2363,241 @@ phase7_channel_config() {
     echo ""
     echo "  1) WebChat (built-in, localhost only - zero setup)"
     echo "  2) Matrix (will install Synapse homeserver if needed)"
+    echo "  3) Signal (signal-cli-rest-api container, link to existing phone via QR)"
     echo ""
     
     CHANNEL_CHOICE=$(prompt_input "Choice" "1")
     
     if [[ "$CHANNEL_CHOICE" == "2" ]]; then
         setup_matrix_homeserver
+    elif [[ "$CHANNEL_CHOICE" == "3" ]]; then
+        setup_signal_channel
     else
         print_step "WebChat selected - available at http://localhost:18789/"
     fi
+}
+
+#-------------------------------------------------------------------------------
+# Signal channel via bbernhard/signal-cli-rest-api (json-rpc) linked as a
+# secondary device of an existing phone (QR link). Tested live and working:
+#   - inbound (contact -> bot -> qwen3:1.7b -> reply) confirmed
+#   - outbound (openclaw message send / direct /v2/send) confirmed
+#-------------------------------------------------------------------------------
+
+# Normalize a phone number to E.164 (German default country code +49).
+normalize_e164() {
+    local raw="${1//[[:space:]]/}"
+    if   [[ "$raw" == +*  ]]; then echo "$raw"
+    elif [[ "$raw" == 00* ]]; then echo "+${raw:2}"
+    elif [[ "$raw" == 0*  ]]; then echo "+49${raw:1}"
+    else                            echo "+$raw"
+    fi
+}
+
+# Write the tailnet QR web-server helper used for device linking.
+write_signal_qr_server() {
+    sudo tee /usr/local/bin/openclaw-signal-qr.py > /dev/null << 'PYQR'
+#!/usr/bin/env python3
+# Minimal tailnet-only web page that renders the current Signal device-link QR
+# (auto-refreshing) so it can be scanned comfortably from another device.
+import sys, time, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+BIND = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8899
+API  = "http://127.0.0.1:8080"
+
+def fetch_qr_png():
+    url = f"{API}/v1/qrcodelink?device_name=OpenClaw-Pi5"
+    with urllib.request.urlopen(url, timeout=25) as r:
+        return r.read()
+
+def accounts():
+    try:
+        with urllib.request.urlopen(f"{API}/v1/accounts", timeout=10) as r:
+            return r.read().decode()
+    except Exception:
+        return "[]"
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith("/status"):
+            body = accounts().encode()
+            self.send_response(200); self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(body))); self.end_headers()
+            self.wfile.write(body); return
+        if self.path.startswith("/qr.png"):
+            try: png = fetch_qr_png()
+            except Exception as e:
+                self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode()); return
+            self.send_response(200); self.send_header("Content-Type","image/png")
+            self.send_header("Content-Length",str(len(png))); self.end_headers()
+            self.wfile.write(png); return
+        html = (b"<!doctype html><meta charset=utf-8>"
+                b"<meta http-equiv=refresh content=45>"
+                b"<title>OpenClaw Signal Link</title>"
+                b"<body style='font-family:sans-serif;text-align:center;background:#111;color:#eee'>"
+                b"<h2>Link this Pi to your Signal app</h2>"
+                b"<p>Signal &rarr; Settings &rarr; Linked Devices &rarr; Link New Device &rarr; scan:</p>"
+                b"<img src='/qr.png?ts=" + str(int(time.time())).encode() +
+                b"' style='width:340px;height:340px;background:#fff;padding:12px;border-radius:12px'>"
+                b"<p style='opacity:.6'>QR refreshes every 45s. Leave this page open until linked.</p>"
+                b"</body>")
+        self.send_response(200); self.send_header("Content-Type","text/html")
+        self.send_header("Content-Length",str(len(html))); self.end_headers()
+        self.wfile.write(html)
+
+HTTPServer((BIND, PORT), H).serve_forever()
+PYQR
+    sudo chmod +x /usr/local/bin/openclaw-signal-qr.py
+}
+
+setup_signal_channel() {
+    print_header "Signal Channel Setup (signal-cli-rest-api + QR link)"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        print_warn "Docker not installed; cannot set up Signal. Skipping."
+        return
+    fi
+    sudo systemctl enable --now docker >/dev/null 2>&1 || true
+
+    # Phone number (env SIGNAL_NUMBER or prompt). Accepts 0.. / 00.. / +.. forms.
+    local num_in="${SIGNAL_NUMBER:-}"
+    if [[ -z "$num_in" ]]; then
+        num_in=$(prompt_input "Signal phone number to link (e.g. 015112345678 or +4915112345678)" "")
+    fi
+    if [[ -z "$num_in" ]]; then
+        print_warn "No Signal number provided; skipping Signal setup."
+        return
+    fi
+    local SIGNAL_E164
+    SIGNAL_E164=$(normalize_e164 "$num_in")
+    print_step "Using Signal number: $SIGNAL_E164"
+
+    # QR render/decode helpers (best effort).
+    sudo apt-get install -y qrencode zbar-tools >/dev/null 2>&1 || true
+
+    # Pull + run signal-cli-rest-api in json-rpc mode (required for receive).
+    print_step "Starting signal-cli-rest-api container (MODE=json-rpc)..."
+    sudo docker pull bbernhard/signal-cli-rest-api:latest >/dev/null 2>&1 \
+        || print_warn "Could not pull signal image (offline?); using cached image if present"
+    sudo docker volume create signal-cli-data >/dev/null 2>&1 || true
+    sudo docker rm -f signal-cli-rest-api >/dev/null 2>&1 || true
+    sudo docker run -d --name signal-cli-rest-api --restart unless-stopped \
+        -e MODE=json-rpc -p 127.0.0.1:8080:8080 \
+        -v signal-cli-data:/home/.local/share/signal-cli \
+        bbernhard/signal-cli-rest-api:latest >/dev/null 2>&1 \
+        || { print_warn "Signal container failed to start"; return; }
+
+    # Wait for the REST API to come up.
+    local ready=false i
+    for i in $(seq 1 30); do
+        if curl -s http://127.0.0.1:8080/v1/about >/dev/null 2>&1; then ready=true; break; fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        print_warn "signal-cli REST API did not become ready; check 'docker logs signal-cli-rest-api'"
+        return
+    fi
+
+    # Link the device if the account isn't present yet.
+    local accounts
+    accounts=$(curl -s http://127.0.0.1:8080/v1/accounts 2>/dev/null)
+    if [[ "$accounts" == *"$SIGNAL_E164"* ]]; then
+        print_step "Signal account $SIGNAL_E164 already linked."
+    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
+        print_warn "Signal not linked and running non-interactively; skipping QR link."
+        print_warn "Link later: curl 'http://127.0.0.1:8080/v1/qrcodelink?device_name=OpenClaw-Pi5' -o qr.png"
+    else
+        print_step "Device link required - generating QR to scan with the Signal app..."
+        write_signal_qr_server
+        local TS_IP TS_HOST qr_pid
+        TS_IP=$(tailscale ip -4 2>/dev/null | head -1)
+        nohup python3 /usr/local/bin/openclaw-signal-qr.py "${TS_IP:-127.0.0.1}" 8899 \
+            >/tmp/openclaw-signal-qr.log 2>&1 &
+        qr_pid=$!
+        if [[ -n "$TS_IP" ]]; then
+            TS_HOST=$(tailscale status --json 2>/dev/null \
+                | python3 -c "import sys,json;print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" 2>/dev/null)
+            echo ""
+            print_step "Open this URL on a phone/computer next to the linking device:"
+            echo "      http://${TS_HOST:-$TS_IP}:8899"
+            echo "      Signal app -> Settings -> Linked Devices -> Link New Device -> scan"
+        fi
+        # Terminal ASCII QR fallback.
+        curl -s --max-time 20 "http://127.0.0.1:8080/v1/qrcodelink?device_name=OpenClaw-Pi5" \
+            -o /tmp/signal-link-qr.png 2>/dev/null || true
+        if command -v zbarimg >/dev/null 2>&1 && command -v qrencode >/dev/null 2>&1; then
+            local uri
+            uri=$(zbarimg --quiet --raw /tmp/signal-link-qr.png 2>/dev/null | head -1)
+            if [[ -n "$uri" ]]; then echo ""; echo "(Terminal QR fallback:)"; qrencode -t ANSIUTF8 "$uri"; fi
+        fi
+        # Poll for linkage (up to ~5 minutes).
+        print_step "Waiting for device link (up to 5 minutes)..."
+        local linked=false
+        for i in $(seq 1 30); do
+            accounts=$(curl -s http://127.0.0.1:8080/v1/accounts 2>/dev/null)
+            if [[ "$accounts" == *"$SIGNAL_E164"* ]]; then linked=true; break; fi
+            sleep 10
+        done
+        kill "$qr_pid" >/dev/null 2>&1 || true
+        rm -f /tmp/signal-link-qr.png
+        if [[ "$linked" != true ]]; then
+            print_warn "Signal device not linked within timeout. The container keeps running;"
+            print_warn "re-run this installer or link manually, then restart the gateway."
+            return
+        fi
+        print_step "Signal linked: $SIGNAL_E164"
+    fi
+
+    # Allowlist + channel config (idempotent edit of openclaw.json).
+    print_step "Configuring OpenClaw Signal channel..."
+    SIGNAL_E164="$SIGNAL_E164" python3 << 'PYCFG'
+import json, os
+p = os.path.expanduser("~/.openclaw/openclaw.json")
+num = os.environ["SIGNAL_E164"]
+with open(p) as f: cfg = json.load(f)
+pl = cfg.setdefault("plugins", {})
+allow = pl.setdefault("allow", [])
+if "signal" not in allow: allow.append("signal")
+pl.setdefault("entries", {}).setdefault("signal", {})["enabled"] = True
+sig = cfg.setdefault("channels", {}).setdefault("signal", {})
+sig.update({"enabled": True, "account": num, "httpUrl": "http://127.0.0.1:8080",
+            "apiMode": "container", "autoStart": False, "dmPolicy": "pairing"})
+with open(p, "w") as f: json.dump(cfg, f, indent=2)
+print("  signal channel configured for", num)
+PYCFG
+
+    if openclaw config validate >/dev/null 2>&1; then
+        print_step "OpenClaw config valid"
+    else
+        print_warn "OpenClaw config validation reported warnings"
+    fi
+
+    # Reload the gateway so the channel starts.
+    systemctl --user restart openclaw-gateway.service >/dev/null 2>&1 || true
+    sleep 8
+
+    # Verify + optional self test-send (gateway binds the tailnet IP).
+    local TS_IP
+    TS_IP=$(tailscale ip -4 2>/dev/null | head -1)
+    print_step "Verifying Signal channel..."
+    OPENCLAW_GATEWAY_URL="ws://${TS_IP:-127.0.0.1}:18789" \
+        openclaw channels status --probe 2>&1 | grep -i signal || true
+    OPENCLAW_GATEWAY_URL="ws://${TS_IP:-127.0.0.1}:18789" \
+        openclaw message send --channel signal --target "$SIGNAL_E164" \
+        -m "OpenClaw Signal bridge is live." >/dev/null 2>&1 \
+        && print_step "Test message sent to $SIGNAL_E164 (see 'Note to Self')." \
+        || print_warn "Test send failed; check the gateway and container."
+
+    echo ""
+    print_warn "First-time DM senders need approval (dmPolicy=pairing). When someone messages"
+    print_warn "the bot you'll get a code; approve with:"
+    echo "      openclaw pairing approve signal <CODE>"
+    print_warn "Loop protection: if you linked your OWN number, messages you send to YOURSELF are"
+    print_warn "ignored. For full two-way self-chat use a DEDICATED Signal number; otherwise have"
+    print_warn "another contact message this number to talk to the bot."
 }
 
 setup_matrix_homeserver() {
@@ -2220,7 +2918,7 @@ main() {
     echo "This installer will set up:"
     echo "  - Node.js 22+ (via n version manager)"
     echo "  - Docker (Trixie-specific)"
-    echo "  - Hailo GenAI stack with qwen2:1.5b"
+    echo "  - Hailo GenAI stack with qwen3:1.7b (GenAI 5.3.0 default)"
     echo "  - Selected claw flavor (OpenClaw/PicoClaw/ZeroClaw/Nanobot/Moltis/IronClaw/NullClaw) with local Hailo model wiring"
     echo "  - molt_tools skill for Moltbook integration"
     echo "  - First boot task: post to Moltbook"
@@ -2249,6 +2947,7 @@ main() {
         phase6_proactive_behaviors
         phase7_channel_config
         phase8_rag_setup
+        ensure_openclaw_boot_autostart
     else
         print_warn "Skipping OpenClaw-specific phases (4-8) for flavor: $CLAW_FLAVOR"
     fi
@@ -2274,8 +2973,9 @@ main() {
         echo "To start OpenClaw:"
         echo "  openclaw gateway --port 18789 --verbose"
         echo ""
-        echo "Dashboard: http://localhost:18789/"
-        echo "Gateway auth: disabled (mode=none)"
+        echo "Dashboard (fixed link): http://<tailscale-ip>:18789/#token=$OPENCLAW_FIXED_TOKEN"
+        echo "  tailscale ip -4"
+        echo "Gateway auth: token (auto in URL fragment)"
     elif [[ "$CLAW_FLAVOR" == "picoclaw" ]]; then
         echo "To start PicoClaw:"
         echo "  ~/.local/bin/picoclaw gateway"

@@ -14,3 +14,13 @@ Thumbs.db
 *.swp
 *.swo
 __pycache__
+# Runtime logs (never publish)
+*.log
+hailort.log
+
+# Local env / secrets
+.env
+
+# Generated Signal/QR artifacts
+signal-link-*.png
+*.bak.*
