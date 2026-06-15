@@ -108,19 +108,19 @@ TRACE_MAX_BYTES = _env_int("HAILO_PROXY_TRACE_MAX_BYTES", 250000)
 #     CODE/WEB/DEFAULT_*=1024  MAX_HISTORY_MESSAGES=40
 # ────────────────────────────────────────────────────────────────────────────
 # Token-Budgets (Output) je Aufgabentyp:
-MAX_PROXY_COMPLETION_TOKENS = 192      # Chat-Obergrenze
-CODE_PROXY_COMPLETION_TOKENS = 512     # Code-Obergrenze
+MAX_PROXY_COMPLETION_TOKENS = 1024     # Chat-Obergrenze  [hailo-node]
+CODE_PROXY_COMPLETION_TOKENS = 1024    # Code-Obergrenze  [hailo-node]
 CODE_MIN_COMPLETION_TOKENS = 384       # Code-Untergrenze (nie weniger)
-WEB_PROXY_COMPLETION_TOKENS = 96       # web-gegroundete Antworten (knapp)
-DEFAULT_PROXY_COMPLETION_TOKENS = 128  # Fallback ohne max_tokens
-MAX_HISTORY_MESSAGES = 4               # behaltene Verlaufs-Nachrichten
+WEB_PROXY_COMPLETION_TOKENS = 1024     # web-gegroundete Antworten  [hailo-node]
+DEFAULT_PROXY_COMPLETION_TOKENS = 1024 # Fallback ohne max_tokens  [hailo-node]
+MAX_HISTORY_MESSAGES = 40              # behaltene Verlaufs-Nachrichten  [hailo-node]
 MAX_MESSAGE_CONTENT_CHARS = 1200       # max. Zeichen je Nachricht
 # Sampling:
-PROXY_TEMPERATURE = 0.15               # Standard-Temperatur
-PROXY_TEMPERATURE_MAX = 0.6            # Deckel, falls Client höher schickt
-PROXY_TOP_P = 0.85                     # nucleus sampling
-PROXY_TOP_K = 0                        # 0 = aus (nicht an Modell senden)
-PROXY_FREQUENCY_PENALTY = 0.0          # 0 = aus (schadet kleinem Modell)
+PROXY_TEMPERATURE = 0.7                # Standard-Temperatur  [hailo-node]
+PROXY_TEMPERATURE_MAX = 0.7            # Deckel, falls Client höher schickt
+PROXY_TOP_P = 0.8                      # nucleus sampling  [hailo-node]
+PROXY_TOP_K = 20                       # top_k  [hailo-node]
+PROXY_FREQUENCY_PENALTY = 1.1          # frequency_penalty  [hailo-node]
 PROXY_PRESENCE_PENALTY = 0.0           # 0 = aus
 # Feature toggles.
 WEB_SEARCH_ENABLED = os.environ.get("HAILO_PROXY_WEB_SEARCH", "1").strip().lower() not in {
@@ -130,12 +130,12 @@ COLLAPSE_REPETITION_ENABLED = os.environ.get(
     "HAILO_PROXY_COLLAPSE_REPETITION", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
 MODEL_TOKEN_CAPS = {
-    "qwen3:1.7b": 192,
-    "qwen2.5-coder:1.5b": 160,
-    "qwen2.5:1.5b": 160,
-    "qwen2:1.5b": 144,
-    "llama3.2:1b": 112,
-    "deepseek_r1:1.5b": 96,
+    "qwen3:1.7b": 1024,
+    "qwen2.5-coder:1.5b": 1024,
+    "qwen2.5:1.5b": 1024,
+    "qwen2:1.5b": 1024,
+    "llama3.2:1b": 1024,
+    "deepseek_r1:1.5b": 1024,
 }
 _TRACE_SEQ = itertools.count(1)
 
