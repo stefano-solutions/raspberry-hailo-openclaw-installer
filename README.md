@@ -155,6 +155,33 @@ USE_SANITIZER_PROXY_ON_OLLAMA=true ./install-openclaw-rpi5.sh
 USE_SANITIZER_PROXY_ON_OLLAMA=false ./install-openclaw-rpi5.sh
 ```
 
+### Proxy tuning (`/etc/hailo-proxy.env`)
+
+Local Hailo inference is free and unlimited — the token caps below exist **only**
+to bound latency (~8 tok/s, so 384 tokens ≈ 48 s) and to stop small 1–2B models
+degenerating into repetition loops on long generations. They are **not** about
+saving tokens. Edit `/etc/hailo-proxy.env`, then
+`sudo systemctl restart hailo-sanitize-proxy.service`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HAILO_PROXY_MAX_TOKENS` | `192` | Upper bound for normal chat replies |
+| `HAILO_PROXY_CODE_TOKENS` | `512` | Higher ceiling for code-generation tasks |
+| `HAILO_PROXY_CODE_MIN_TOKENS` | `384` | Floor so a stingy client can't truncate code |
+| `HAILO_PROXY_WEB_TOKENS` | `96` | Cap for web-grounded answers (fact is in first sentences) |
+| `HAILO_PROXY_DEFAULT_TOKENS` | `128` | Used when the client sends no `max_tokens` |
+| `HAILO_PROXY_TEMPERATURE` | `0.15` | Lower = more factual/stable |
+| `HAILO_PROXY_TOP_P` | `0.85` | Nucleus sampling |
+| `HAILO_PROXY_MAX_HISTORY_MESSAGES` | `4` | Past turns sent to the model |
+| `HAILO_PROXY_MAX_MESSAGE_CHARS` | `1200` | Per-message truncation length |
+| `HAILO_PROXY_WEB_SEARCH` | `1` | Toggle automatic web search (`0` disables) |
+| `HAILO_PROXY_COLLAPSE_REPETITION` | `1` | Toggle the repetition-loop cleaner |
+| `HAILO_MODEL` | `qwen2:1.5b` | Default model when the client names none |
+
+Code tasks are auto-detected (keywords like `python`, `funktion`, `klasse`,
+`schleife`, …) and never trigger web search; they use the higher code budget so
+functions/classes aren't cut off mid-body.
+
 ## Configuration flags (`.env.example`)
 
 See [`./.env.example`](./.env.example) for complete examples.

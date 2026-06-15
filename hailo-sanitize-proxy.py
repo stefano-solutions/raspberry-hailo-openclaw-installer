@@ -77,27 +77,47 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 TRACE_ENABLED = os.environ.get("HAILO_PROXY_TRACE", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
 TRACE_DIR = os.environ.get("HAILO_PROXY_TRACE_DIR", "/tmp/hailo-proxy-traces")
 TRACE_MAX_BYTES = _env_int("HAILO_PROXY_TRACE_MAX_BYTES", 250000)
-# TUNING (verified on Pi5 + Hailo 5.3.0, qwen3:1.7b):
-#  - Token caps below are intentionally tight. Benchmarks showed that raising
-#    the cap (e.g. 320/384) makes the 1.7B model run into degenerate repetition
-#    loops and jumps latency from ~12s to 40-66s. 192/128 keeps replies fast & clean.
-#  - EXCEPTION: code-generation tasks need more room (a small class easily
-#    exceeds 192 tokens and gets truncated mid-function). For those we allow a
-#    higher CODE cap — structured code is far less prone to the prose repetition
-#    loops that motivated the tight default.
+# TUNING (verified on Pi5 + Hailo 5.3.0, qwen3:1.7b) — ALL values overridable
+# via environment variables (see /etc/hailo-proxy.env). Local Hailo inference is
+# free and unlimited; these caps exist ONLY to (a) bound latency (~8 tok/s, so
+# 384 tok ~= 48s) and (b) stop small 1-2B models degenerating into repetition
+# loops on long generations. Raise them if you prefer longer answers over speed.
 #  - frequency_penalty / presence_penalty were tested and HURT this small model
 #    (produced broken loops like 'der Prozyn der Prozyn...'), so they stay unset.
 #  - temperature 0.15 / top_p 0.85 give correct, stable factual answers.
 MAX_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_MAX_TOKENS", 192)
 CODE_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_CODE_TOKENS", 512)
+CODE_MIN_COMPLETION_TOKENS = _env_int("HAILO_PROXY_CODE_MIN_TOKENS", 384)
+WEB_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_WEB_TOKENS", 96)
 DEFAULT_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_DEFAULT_TOKENS", 128)
 MAX_HISTORY_MESSAGES = _env_int("HAILO_PROXY_MAX_HISTORY_MESSAGES", 4)
 MAX_MESSAGE_CONTENT_CHARS = _env_int("HAILO_PROXY_MAX_MESSAGE_CHARS", 1200)
+# Sampling. Defaults stay conservative for factual stability; override to taste.
+PROXY_TEMPERATURE = _env_float("HAILO_PROXY_TEMPERATURE", 0.15)
+PROXY_TEMPERATURE_MAX = _env_float("HAILO_PROXY_TEMPERATURE_MAX", 0.6)
+PROXY_TOP_P = _env_float("HAILO_PROXY_TOP_P", 0.85)
+# Feature toggles.
+WEB_SEARCH_ENABLED = os.environ.get("HAILO_PROXY_WEB_SEARCH", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+COLLAPSE_REPETITION_ENABLED = os.environ.get(
+    "HAILO_PROXY_COLLAPSE_REPETITION", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 MODEL_TOKEN_CAPS = {
     "qwen3:1.7b": 192,
     "qwen2.5-coder:1.5b": 160,
@@ -566,7 +586,7 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
             else:
                 clean_query = ""
 
-            if clean_query and should_trigger_web_search(clean_query):
+            if WEB_SEARCH_ENABLED and clean_query and should_trigger_web_search(clean_query):
                 search_result = perform_web_search(clean_query)
                 if search_result:
                     sys.stderr.write(
@@ -619,13 +639,13 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     if is_code_task(clean_query):
         proxy_cap = CODE_PROXY_COMPLETION_TOKENS
         per_model_cap = max(per_model_cap, CODE_PROXY_COMPLETION_TOKENS)
-        requested_tokens = max(requested_tokens, 384)
+        requested_tokens = max(requested_tokens, CODE_MIN_COMPLETION_TOKENS)
     sanitized["max_tokens"] = min(requested_tokens, per_model_cap, proxy_cap)
     # Web-grounded answers: the useful fact is in the first 1-2 sentences. Cap
     # tighter so the small model stops before it degenerates into number loops
     # ("1. Halbzeit, 2., 3., ..."). collapse_repetition cleans the rest.
     if web_search_injected:
-        sanitized["max_tokens"] = min(sanitized["max_tokens"], 96)
+        sanitized["max_tokens"] = min(sanitized["max_tokens"], WEB_PROXY_COMPLETION_TOKENS)
     sanitized.pop("max_completion_tokens", None)
 
     if isinstance(sanitized.get("n"), int) and sanitized["n"] > 1:
@@ -633,12 +653,12 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
 
     temperature = sanitized.get("temperature")
     if not isinstance(temperature, (int, float)):
-        temperature = 0.15
-    sanitized["temperature"] = max(0.0, min(float(temperature), 0.6))
+        temperature = PROXY_TEMPERATURE
+    sanitized["temperature"] = max(0.0, min(float(temperature), PROXY_TEMPERATURE_MAX))
 
     top_p = sanitized.get("top_p")
     if not isinstance(top_p, (int, float)):
-        top_p = 0.85
+        top_p = PROXY_TOP_P
     sanitized["top_p"] = max(0.7, min(float(top_p), 0.95))
 
     if "messages" in sanitized:
@@ -1030,7 +1050,8 @@ def sanitize_response(
                     latest_user_text=latest_user_text,
                     allowed_tool_names=allowed_tool_names,
                 )
-            content = collapse_repetition(content)
+            if COLLAPSE_REPETITION_ENABLED:
+                content = collapse_repetition(content)
             total_chars += len(content)
             choice["message"] = {
                 "role": msg.get("role", "assistant"),

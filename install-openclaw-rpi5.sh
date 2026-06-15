@@ -1364,7 +1364,64 @@ EOF
         else
             sudo cp "$PROXY_SRC" /usr/local/bin/hailo-sanitize-proxy.py
             sudo chmod +x /usr/local/bin/hailo-sanitize-proxy.py
-            
+
+            # Tuning configuration. Local Hailo inference is free/unlimited; the
+            # token caps below only bound latency (~8 tok/s) and curb repetition
+            # loops on small models. Everything is overridable here. We only write
+            # defaults if the file doesn't exist yet, so we never clobber a user's
+            # customised values on re-runs.
+            if [[ ! -f /etc/hailo-proxy.env ]]; then
+                sudo tee /etc/hailo-proxy.env > /dev/null << 'ENVEOF'
+# =====================================================================
+# Hailo Sanitizing Proxy — Konfiguration
+# =====================================================================
+# Steuert /usr/local/bin/hailo-sanitize-proxy.py.
+# Nach Aenderungen:  sudo systemctl restart hailo-sanitize-proxy.service
+#
+# HINTERGRUND: Lokale Hailo-Inferenz ist kostenlos und unbegrenzt. Die Token-
+# Caps existieren NICHT zum Sparen, sondern nur um (a) die Antwortzeit zu
+# begrenzen (~8 Token/s, d.h. 384 Token ca. 48s) und (b) zu verhindern, dass
+# kleine 1-2B-Modelle bei langen Antworten in Wiederhol-Schleifen geraten.
+# Hoeher = laengere/vollstaendigere Antworten, aber langsamer.
+# ---------------------------------------------------------------------
+
+# --- Token-Budgets (Anzahl generierter Token) ---
+HAILO_PROXY_MAX_TOKENS=192          # Normale Chat-Antworten (Obergrenze)
+HAILO_PROXY_CODE_TOKENS=512         # Code-Aufgaben (Funktionen/Klassen)
+HAILO_PROXY_CODE_MIN_TOKENS=384     # Untergrenze fuer Code
+HAILO_PROXY_WEB_TOKENS=96           # Web-gestuetzte Antworten
+HAILO_PROXY_DEFAULT_TOKENS=128      # Standard, wenn Client nichts schickt
+
+# --- Sampling ---
+HAILO_PROXY_TEMPERATURE=0.15        # Niedrig = faktentreu/stabil
+HAILO_PROXY_TEMPERATURE_MAX=0.6
+HAILO_PROXY_TOP_P=0.85
+
+# --- Kontext ---
+HAILO_PROXY_MAX_HISTORY_MESSAGES=4
+HAILO_PROXY_MAX_MESSAGE_CHARS=1200
+
+# --- Feature-Schalter (1=an, 0=aus) ---
+HAILO_PROXY_WEB_SEARCH=1            # Automatische Web-Suche bei Recherche-Fragen
+HAILO_PROXY_COLLAPSE_REPETITION=1  # Wiederhol-Schleifen-Bremse
+
+# --- Standardmodell (falls Client keins angibt) ---
+HAILO_MODEL=qwen2:1.5b
+
+# --- BEISPIEL-PROFILE (auskommentiert) ---
+# Lange, vollstaendige Antworten (langsamer):
+#   HAILO_PROXY_MAX_TOKENS=512
+#   HAILO_PROXY_CODE_TOKENS=1024
+# Maximal schnell (kurze Antworten):
+#   HAILO_PROXY_MAX_TOKENS=128
+#   HAILO_PROXY_CODE_TOKENS=320
+ENVEOF
+                sudo chmod 644 /etc/hailo-proxy.env
+                print_step "Wrote default tuning config to /etc/hailo-proxy.env"
+            else
+                print_step "Keeping existing /etc/hailo-proxy.env (not overwritten)"
+            fi
+
             sudo tee /etc/systemd/system/hailo-sanitize-proxy.service > /dev/null << 'EOF'
 [Unit]
 Description=Hailo-Ollama Sanitizing Proxy
@@ -1373,6 +1430,9 @@ Requires=hailo-ollama.service
 
 [Service]
 Type=simple
+# Tuning-Parameter (Token-Caps, Sampling, Feature-Schalter). Das '-' macht die
+# Datei optional: fehlt sie, gelten die Defaults im Python-Skript.
+EnvironmentFile=-/etc/hailo-proxy.env
 ExecStart=/usr/bin/python3 /usr/local/bin/hailo-sanitize-proxy.py
 Restart=always
 RestartSec=3
