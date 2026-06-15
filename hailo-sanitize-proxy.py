@@ -24,6 +24,7 @@ import html
 import sys
 import time
 import itertools
+import shlex
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -148,13 +149,19 @@ TOOL_INTENT_TOKENS = (
 )
 MEDIA_ATTACHED_MARKER_RE = re.compile(r"\[media attached:[^\]]+\]", re.IGNORECASE)
 
-# Tools the 1.5B model can't invoke correctly — suppress these.
-# File tools: model generates absolute paths outside sandbox → always fails.
-# Session tools: model can't format array arguments correctly.
-# Search/process: model loops endlessly on these.
-# Only "exec" is allowed through (proxy can normalize the command).
+# Tool-calling strategy (aligned with how small models actually behave):
+# `exec` is the only OpenClaw tool a 1.5-1.7B model drives reliably, so instead of
+# SILENTLY DROPPING file/listing tool calls (which left raw JSON in the reply and
+# looked broken to the user), we REMAP them onto `exec` with a concrete shell
+# command. Tools that cannot be expressed as a single shell command are still
+# suppressed — but their raw JSON is scrubbed from the content (never shown).
+#
+# Remappable -> exec:
+FILE_READ_TOOL_NAMES = {"read", "view", "open", "cat", "get_file", "readfile"}
+LIST_TOOL_NAMES = {"search", "find", "glob", "ls", "list", "list_files", "process"}
+# Hard-suppressed (no safe single-command equivalent for a tiny model):
 BLOCKED_TOOL_NAMES = {
-    "read", "write", "edit", "search", "process",
+    "write", "edit", "apply_patch",
     "sessions_list", "sessions_history", "sessions_send",
     "sessions_spawn", "session_status",
 }
@@ -792,10 +799,46 @@ def simplify_messages(messages, tool_prompt=None):
     # Hailo constraint: system messages only allowed on first prompt (no continuations)
     # If other_msgs has history (>1 message), don't include system message
     is_continuation = len(other_msgs) > 1
+
+    # Has a tool already run in this conversation? (converted results are tagged.)
+    def _is_tool_result(msg):
+        return (
+            msg.get("role") == "user"
+            and str(msg.get("content", "")).startswith("Werkzeug-Ergebnis:")
+        )
+
+    has_tool_result = any(_is_tool_result(m) for m in other_msgs)
+
     if is_continuation:
-        # The system message (and with it the tool instructions) would be
-        # dropped on continuations. Re-inject a compact tool instruction into
-        # the LAST user message so multi-turn conversations keep tool access.
+        if has_tool_result:
+            # A tool already executed. RE-INJECTING the "call a tool" prompt here is
+            # what caused infinite tool loops: the small model always obeys the most
+            # recent instruction, so it kept calling tools instead of answering.
+            # Instead, surface the latest tool result as the FINAL, most salient
+            # message with a firm "answer now, do not call another tool" directive.
+            last_idx = None
+            for i in range(len(other_msgs) - 1, -1, -1):
+                if _is_tool_result(other_msgs[i]):
+                    last_idx = i
+                    break
+            if last_idx is not None:
+                result_msg = other_msgs.pop(last_idx)
+                raw = result_msg["content"]
+                # Drop any previously appended instruction, keep just the data.
+                data = raw.split(" | Beantworte", 1)[0]
+                data = data[len("Werkzeug-Ergebnis:"):].strip()
+                other_msgs.append({
+                    "role": "user",
+                    "content": _flatten_for_hailo(
+                        "Werkzeug-Ergebnis: " + data
+                        + " | Das ist das Ergebnis des Werkzeugs. Beantworte damit "
+                        "JETZT die urspruengliche Frage des Nutzers in kurzen Saetzen. "
+                        "Rufe KEIN weiteres Werkzeug auf und gib KEIN JSON aus."
+                    ),
+                })
+            return other_msgs
+        # No tool has run yet: keep tool access alive on continuations by
+        # re-injecting a compact tool instruction into the LAST user message.
         if tool_prompt and other_msgs:
             flat_tool_prompt = _flatten_for_hailo(tool_prompt)
             for i in range(len(other_msgs) - 1, -1, -1):
@@ -1050,19 +1093,92 @@ def normalize_exec_command(command):
     return cmd
 
 
-def _has_rag_intent(text):
-    norm = str(text or "").lower()
-    return "rag" in norm
+def _normalize_fs_path(path):
+    """Best-effort cleanup of model-written paths (e.g. 'Home/pi/Downloads')."""
+    if not isinstance(path, str):
+        return ""
+    p = path.strip().strip('"').strip("'")
+    if not p:
+        return ""
+    if p.startswith("~"):
+        return os.path.expanduser(p)
+    # Model frequently writes 'Home/pi/...' / 'home/pi/...' without a leading slash.
+    if p.lower().startswith("home/"):
+        p = "/home/" + p[5:]
+    return p
+
+
+def _looks_like_dir(path, user_text):
+    """Heuristic: does the user want a directory listing rather than file contents?"""
+    p = (path or "").rstrip("/")
+    base = os.path.basename(p).lower()
+    # A trailing slash is an explicit directory marker.
+    if (path or "").rstrip().endswith("/"):
+        return True
+    # A real file extension on the last segment → treat as a file (cat), even if
+    # the prompt mentions "Inhalt"/"content".
+    has_ext = "." in base and not base.startswith(".")
+    if has_ext:
+        return False
+    txt = str(user_text or "").lower()
+    listing_words = (
+        "dateinamen", "dateien", "ordner", "verzeichnis", "übersicht", "uebersicht",
+        "filenames", "files", "folder", "directory", "list", "liste", "auflist",
+    )
+    if any(w in txt for w in listing_words):
+        return True
+    # No extension and no listing hint → still most likely a directory path.
+    return True
 
 
 def remap_tool_call(tool_call, latest_user_text, allowed_tool_names):
+    """Normalize/translate a parsed tool call.
+
+    Returns (tool_call_or_None, suppressed_bool). When suppressed_bool is True the
+    caller must scrub the raw JSON from the assistant content so the user never
+    sees a broken tool-call block.
+    """
     if not tool_call or not isinstance(tool_call, dict):
-        return tool_call
+        return tool_call, False
 
     name = tool_call.get("name")
     args = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
 
-    # Block internal tools the small model can't use correctly
+    # exec: pass through, just normalize the command string.
+    if name == "exec":
+        cmd = normalize_exec_command(args.get("command", ""))
+        if cmd:
+            tool_call["arguments"] = {"command": cmd}
+        return tool_call, False
+
+    # If OpenClaw didn't even offer exec, we can't remap — fall through to block.
+    exec_available = (allowed_tool_names is None) or ("exec" in allowed_tool_names)
+
+    path = (
+        args.get("path") or args.get("file_path") or args.get("filepath")
+        or args.get("dir") or args.get("directory") or args.get("target") or ""
+    )
+    path = _normalize_fs_path(path)
+
+    # read/view/open/cat → exec (ls for directories, cat for files).
+    if name in FILE_READ_TOOL_NAMES and path and exec_available:
+        if _looks_like_dir(path, latest_user_text):
+            cmd = "ls -1 %s" % shlex.quote(path)
+        else:
+            cmd = "cat %s" % shlex.quote(path)
+        return {"name": "exec", "arguments": {"command": cmd}}, False
+
+    # search/find/glob/process → exec (grep when a pattern is given, else ls).
+    if name in LIST_TOOL_NAMES and exec_available:
+        pattern = args.get("pattern") or args.get("query") or args.get("q") or ""
+        target = path or "."
+        if isinstance(pattern, str) and pattern.strip():
+            cmd = "grep -rn %s %s" % (shlex.quote(pattern.strip()), shlex.quote(target))
+        else:
+            cmd = "ls -1 %s" % shlex.quote(target)
+        return {"name": "exec", "arguments": {"command": cmd}}, False
+
+    # Hard-suppressed tools: drop the call AND signal a content scrub.
     if name in BLOCKED_TOOL_NAMES:
         try:
             sys.stderr.write(
@@ -1071,15 +1187,15 @@ def remap_tool_call(tool_call, latest_user_text, allowed_tool_names):
             sys.stderr.flush()
         except Exception:
             pass
-        return None
+        return None, True
 
-    if name == "exec":
-        cmd = normalize_exec_command(args.get("command", ""))
-        if cmd:
-            tool_call["arguments"] = {"command": cmd}
-        return tool_call
+    # Unknown/other tool the model offered: let it through unchanged.
+    return tool_call, False
 
-    return tool_call
+
+def _has_rag_intent(text):
+    norm = str(text or "").lower()
+    return "rag" in norm
 
 
 def _collapse_prose(text):
@@ -1191,15 +1307,24 @@ def sanitize_response(
             msg = choice.get("message", {})
             content = msg.get("content", "")
             tool_call = None
+            suppressed = False
             if tool_calls_enabled:
-                tool_call = parse_tool_call(content, allowed_names=allowed_tool_names)
-                tool_call = remap_tool_call(
-                    tool_call,
+                parsed = parse_tool_call(content, allowed_names=allowed_tool_names)
+                tool_call, suppressed = remap_tool_call(
+                    parsed,
                     latest_user_text=latest_user_text,
                     allowed_tool_names=allowed_tool_names,
                 )
             if COLLAPSE_REPETITION_ENABLED:
                 content = collapse_repetition(content)
+            # If we parsed a tool call but suppressed it, never leak the raw JSON
+            # block to the user — replace it with a short, honest fallback.
+            if suppressed:
+                content = (
+                    "Diese Aktion kann ich mit dem lokalen Modell nicht direkt "
+                    "ausführen. Bitte formuliere die Aufgabe so um, dass sie sich "
+                    "mit einem Shell-Befehl (exec) erledigen lässt."
+                )
             total_chars += len(content)
             choice["message"] = {
                 "role": msg.get("role", "assistant"),
