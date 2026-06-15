@@ -24,13 +24,32 @@ Automated installer for local AI assistants on Raspberry Pi 5 + Hailo-10H (AI HA
 
 This project installs and configures a local assistant stack on Raspberry Pi:
 
-1. System/runtime dependencies (Node, Docker, etc.)
+1. System/runtime dependencies (Node, a JRE for Signal, etc. — Docker is optional)
 2. Hailo GenAI stack (`hailo-ollama`) and optional sanitizing proxy
 3. Selected assistant flavor (`openclaw`, `picoclaw`, `zeroclaw`, `nanobot`, `moltis`, `ironclaw`, or `nullclaw`)
 4. Optional OpenClaw-only extras (molt_tools, channel setup, RAG)
 5. Validation and SSH test scripts
 
 For the main entrypoint see [`install-openclaw-rpi5.sh`](./install-openclaw-rpi5.sh).
+
+### No venv, no Docker (update-friendly)
+
+The whole default stack runs **without Python virtualenvs and without Docker**, so
+it stays simple and benefits from normal system updates:
+
+- **Python**: the proxy and facade use the system `python3` (stdlib only). Optional
+  Python add-ons (Nanobot, RAG) install system-wide via `pip install --break-system-packages`
+  instead of a venv, so `pip install --break-system-packages -U <pkg>` keeps them current.
+- **Signal**: runs as a **native `signal-cli` JSON-RPC daemon** (systemd unit
+  `signal-cli-daemon.service`, bound to `127.0.0.1:8080`) instead of the
+  `signal-cli-rest-api` Docker container. OpenClaw talks to it with
+  `channels.signal.apiMode="native"`. Requires a JRE (`openjdk-25-jre-headless`).
+- **Docker**: only the optional **Matrix** homeserver still needs it. Run the
+  installer with `INSTALL_DOCKER=true` if you want Matrix; otherwise Docker is skipped.
+- **Updates**: `sudo apt update && sudo apt full-upgrade -y` is safe — the seven
+  Hailo packages are held (`apt-mark hold`) so the validated 5.3.0 stack is never
+  bumped. `npm i -g openclaw@latest` and `pip install --break-system-packages -U …`
+  update the rest.
 
 ## Supported flavors
 

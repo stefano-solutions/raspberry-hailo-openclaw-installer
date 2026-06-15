@@ -1,0 +1,29 @@
+# Reference unit for the NATIVE signal-cli JSON-RPC daemon (no Docker).
+# The installer generates this dynamically in setup_signal_channel() with the
+# linked account number and the detected JAVA_HOME substituted in.
+#
+# Replaces the bbernhard/signal-cli-rest-api Docker container. OpenClaw talks to
+# it via channels.signal.apiMode="native" at http://127.0.0.1:8080.
+#
+# Requirements:
+#   - openjdk-25-jre-headless (signal-cli 0.14.5 ships class-file v69 builds)
+#   - signal-cli extracted to /opt/signal-cli-<version>, symlinked to /usr/local/bin/signal-cli
+#   - account data in ~/.local/share/signal-cli (link once: signal-cli link -n OpenClaw-Pi5)
+
+[Unit]
+Description=signal-cli JSON-RPC HTTP daemon (native, replaces docker signal-cli-rest-api)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Environment=JAVA_HOME=/usr/lib/jvm/java-25-openjdk-arm64
+Environment=PATH=/usr/lib/jvm/java-25-openjdk-arm64/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/signal-cli --config /home/pi/.local/share/signal-cli -a +490000000000 daemon --http 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

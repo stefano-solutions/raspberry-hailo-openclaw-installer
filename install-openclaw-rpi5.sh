@@ -891,8 +891,12 @@ phase1_system_prep_online() {
     NODE_VERSION=$(node -v 2>/dev/null || echo "not installed")
     print_step "Node.js version: $NODE_VERSION"
     
-    # Install Docker (Trixie-specific method)
-    if ! command -v docker &> /dev/null; then
+    # Docker is OPTIONAL now: the core runtime (Hailo + proxy + facade + OpenClaw)
+    # and the Signal channel (native signal-cli) need NO Docker. Only the optional
+    # Matrix homeserver does. Install only if explicitly requested (INSTALL_DOCKER=true).
+    if [[ "${INSTALL_DOCKER:-false}" != "true" ]]; then
+        print_step "Skipping Docker install (not required; set INSTALL_DOCKER=true for the Matrix channel)"
+    elif ! command -v docker &> /dev/null; then
         print_step "Installing Docker (Trixie-specific method)..."
         sudo apt install -y ca-certificates curl gnupg
         
@@ -935,8 +939,10 @@ phase1_system_prep_offline() {
         exit 1
     fi
     
-    # Install Docker from bundled .deb packages
-    if ! command -v docker &> /dev/null; then
+    # Install Docker from bundled .deb packages (optional; only for Matrix)
+    if [[ "${INSTALL_DOCKER:-false}" != "true" ]]; then
+        print_step "Skipping Docker install (not required; set INSTALL_DOCKER=true for the Matrix channel)"
+    elif ! command -v docker &> /dev/null; then
         print_step "Installing Docker from offline bundle..."
         
         if [[ -d "$OFFLINE_DIR/docker_debs" ]]; then
@@ -1872,26 +1878,17 @@ phase3_nanobot_install() {
     local model_base_url
     model_base_url="$(get_hailo_openai_base_url)"
 
-    if ! command -v pipx &> /dev/null; then
-        print_step "Installing pipx and Python venv support for Nanobot..."
-        sudo apt update
-        sudo apt install -y pipx python3-venv
-    fi
-
-    if ! command -v pipx &> /dev/null; then
-        print_error "pipx not available after install attempt"
+    # No venv/pipx: install Nanobot system-wide so it benefits from `pip` updates.
+    print_step "Installing/upgrading Nanobot (nanobot-ai) system-wide (no venv)..."
+    sudo apt install -y python3-pip >/dev/null 2>&1 || true
+    if ! python3 -m pip install --break-system-packages --upgrade nanobot-ai; then
+        print_error "Failed to install nanobot-ai via pip --break-system-packages"
         return 1
     fi
-
-    python3 -m pipx ensurepath >/dev/null 2>&1 || true
-
-    if pipx list 2>/dev/null | grep -q "package nanobot-ai"; then
-        print_step "Upgrading Nanobot (nanobot-ai) via pipx..."
-        pipx upgrade nanobot-ai
-    else
-        print_step "Installing Nanobot (nanobot-ai) via pipx..."
-        pipx install nanobot-ai
-    fi
+    # Ensure the user-script dir (where pip may place the entrypoint) is on PATH.
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *)
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc" ;;
+    esac
 
     mkdir -p "$HOME/.nanobot"
     cat > "$HOME/.nanobot/config.json" << EOF
@@ -2423,7 +2420,7 @@ phase7_channel_config() {
     echo ""
     echo "  1) WebChat (built-in, localhost only - zero setup)"
     echo "  2) Matrix (will install Synapse homeserver if needed)"
-    echo "  3) Signal (signal-cli-rest-api container, link to existing phone via QR)"
+    echo "  3) Signal (native signal-cli daemon, link to existing phone via QR)"
     echo ""
     
     CHANNEL_CHOICE=$(prompt_input "Choice" "1")
@@ -2438,11 +2435,20 @@ phase7_channel_config() {
 }
 
 #-------------------------------------------------------------------------------
-# Signal channel via bbernhard/signal-cli-rest-api (json-rpc) linked as a
-# secondary device of an existing phone (QR link). Tested live and working:
+# Signal channel via NATIVE signal-cli (no Docker). signal-cli runs its built-in
+# JSON-RPC HTTP daemon on 127.0.0.1:8080 and OpenClaw talks to it directly with
+# channels.signal.apiMode="native". The Pi is linked as a secondary device of an
+# existing phone (QR link). Tested live and working:
 #   - inbound (contact -> bot -> qwen3:1.7b -> reply) confirmed
-#   - outbound (openclaw message send / direct /v2/send) confirmed
+#   - outbound (openclaw message send / JSON-RPC send) confirmed
 #-------------------------------------------------------------------------------
+
+# Pinned signal-cli version (matches the validated runtime). Override via env.
+SIGNAL_CLI_VERSION="${SIGNAL_CLI_VERSION:-0.14.5}"
+SIGNAL_CLI_HOME="/opt/signal-cli-${SIGNAL_CLI_VERSION}"
+# signal-cli 0.14.5 ships class-file v69 builds -> needs a Java 25 runtime.
+SIGNAL_JRE_PKG="${SIGNAL_JRE_PKG:-openjdk-25-jre-headless}"
+SIGNAL_CONFIG_DIR="${SIGNAL_CONFIG_DIR:-$HOME/.local/share/signal-cli}"
 
 # Normalize a phone number to E.164 (German default country code +49).
 normalize_e164() {
@@ -2454,55 +2460,100 @@ normalize_e164() {
     fi
 }
 
-# Write the tailnet QR web-server helper used for device linking.
+# Resolve a usable JAVA_HOME (prefer Java 25, else newest installed JDK/JRE).
+detect_java_home() {
+    local jh
+    jh=$(ls -d /usr/lib/jvm/java-25-openjdk-* 2>/dev/null | head -1)
+    [[ -z "$jh" ]] && jh=$(ls -d /usr/lib/jvm/java-*-openjdk-* 2>/dev/null | sort -V | tail -1)
+    echo "$jh"
+}
+
+# Install a JRE + native signal-cli into /opt (idempotent, no Docker).
+install_signal_cli_native() {
+    if [[ -x "$SIGNAL_CLI_HOME/bin/signal-cli" ]]; then
+        print_step "signal-cli ${SIGNAL_CLI_VERSION} already installed"
+    else
+        print_step "Installing Java runtime (${SIGNAL_JRE_PKG}) for signal-cli..."
+        sudo apt-get install -y "$SIGNAL_JRE_PKG" >/dev/null 2>&1 \
+            || sudo apt-get install -y default-jre-headless >/dev/null 2>&1 \
+            || print_warn "Could not install a JRE automatically"
+
+        local tarball="signal-cli-${SIGNAL_CLI_VERSION}.tar.gz"
+        local url="https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/${tarball}"
+        print_step "Downloading native signal-cli ${SIGNAL_CLI_VERSION}..."
+        if [[ -f "$OFFLINE_DIR/$tarball" ]]; then
+            sudo tar -xzf "$OFFLINE_DIR/$tarball" -C /opt
+        elif curl -fsSL "$url" -o "/tmp/$tarball" 2>/dev/null; then
+            sudo tar -xzf "/tmp/$tarball" -C /opt && rm -f "/tmp/$tarball"
+        else
+            print_warn "Could not download signal-cli (offline?). Skipping Signal setup."
+            return 1
+        fi
+    fi
+    sudo ln -sf "$SIGNAL_CLI_HOME/bin/signal-cli" /usr/local/bin/signal-cli
+    command -v signal-cli >/dev/null 2>&1 || { print_warn "signal-cli not on PATH"; return 1; }
+    return 0
+}
+
+# Write + enable the native signal-cli JSON-RPC daemon systemd unit.
+write_signal_daemon_service() {
+    local account="$1" jh
+    jh=$(detect_java_home)
+    sudo tee /etc/systemd/system/signal-cli-daemon.service > /dev/null << EOF
+[Unit]
+Description=signal-cli JSON-RPC HTTP daemon (native, replaces docker signal-cli-rest-api)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${USER}
+Environment=JAVA_HOME=${jh}
+Environment=PATH=${jh}/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/signal-cli --config ${SIGNAL_CONFIG_DIR} -a ${account} daemon --http 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable signal-cli-daemon.service >/dev/null 2>&1 || true
+}
+
+# Write a tailnet-only web page that renders a static QR PNG for device linking.
 write_signal_qr_server() {
     sudo tee /usr/local/bin/openclaw-signal-qr.py > /dev/null << 'PYQR'
 #!/usr/bin/env python3
-# Minimal tailnet-only web page that renders the current Signal device-link QR
-# (auto-refreshing) so it can be scanned comfortably from another device.
-import sys, time, urllib.request
+# Minimal tailnet-only web page that renders a pre-generated Signal device-link
+# QR PNG (path passed as argv[3]) so it can be scanned from another device.
+import sys, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BIND = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8899
-API  = "http://127.0.0.1:8080"
-
-def fetch_qr_png():
-    url = f"{API}/v1/qrcodelink?device_name=OpenClaw-Pi5"
-    with urllib.request.urlopen(url, timeout=25) as r:
-        return r.read()
-
-def accounts():
-    try:
-        with urllib.request.urlopen(f"{API}/v1/accounts", timeout=10) as r:
-            return r.read().decode()
-    except Exception:
-        return "[]"
+QR_PNG = sys.argv[3] if len(sys.argv) > 3 else "/tmp/signal-link-qr.png"
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
-        if self.path.startswith("/status"):
-            body = accounts().encode()
-            self.send_response(200); self.send_header("Content-Type","application/json")
-            self.send_header("Content-Length",str(len(body))); self.end_headers()
-            self.wfile.write(body); return
         if self.path.startswith("/qr.png"):
-            try: png = fetch_qr_png()
+            try:
+                with open(QR_PNG, "rb") as f: png = f.read()
             except Exception as e:
                 self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode()); return
             self.send_response(200); self.send_header("Content-Type","image/png")
             self.send_header("Content-Length",str(len(png))); self.end_headers()
             self.wfile.write(png); return
         html = (b"<!doctype html><meta charset=utf-8>"
-                b"<meta http-equiv=refresh content=45>"
+                b"<meta http-equiv=refresh content=20>"
                 b"<title>OpenClaw Signal Link</title>"
                 b"<body style='font-family:sans-serif;text-align:center;background:#111;color:#eee'>"
                 b"<h2>Link this Pi to your Signal app</h2>"
                 b"<p>Signal &rarr; Settings &rarr; Linked Devices &rarr; Link New Device &rarr; scan:</p>"
-                b"<img src='/qr.png?ts=" + str(int(time.time())).encode() +
-                b"' style='width:340px;height:340px;background:#fff;padding:12px;border-radius:12px'>"
-                b"<p style='opacity:.6'>QR refreshes every 45s. Leave this page open until linked.</p>"
+                b"<img src='/qr.png' style='width:340px;height:340px;background:#fff;padding:12px;border-radius:12px'>"
+                b"<p style='opacity:.6'>Leave this page open until linked.</p>"
                 b"</body>")
         self.send_response(200); self.send_header("Content-Type","text/html")
         self.send_header("Content-Length",str(len(html))); self.end_headers()
@@ -2514,13 +2565,7 @@ PYQR
 }
 
 setup_signal_channel() {
-    print_header "Signal Channel Setup (signal-cli-rest-api + QR link)"
-
-    if ! command -v docker >/dev/null 2>&1; then
-        print_warn "Docker not installed; cannot set up Signal. Skipping."
-        return
-    fi
-    sudo systemctl enable --now docker >/dev/null 2>&1 || true
+    print_header "Signal Channel Setup (native signal-cli + QR link, no Docker)"
 
     # Phone number (env SIGNAL_NUMBER or prompt). Accepts 0.. / 00.. / +.. forms.
     local num_in="${SIGNAL_NUMBER:-}"
@@ -2535,46 +2580,48 @@ setup_signal_channel() {
     SIGNAL_E164=$(normalize_e164 "$num_in")
     print_step "Using Signal number: $SIGNAL_E164"
 
-    # QR render/decode helpers (best effort).
-    sudo apt-get install -y qrencode zbar-tools >/dev/null 2>&1 || true
+    # Install native signal-cli (+JRE). Bail out cleanly if unavailable.
+    install_signal_cli_native || return
 
-    # Pull + run signal-cli-rest-api in json-rpc mode (required for receive).
-    print_step "Starting signal-cli-rest-api container (MODE=json-rpc)..."
-    sudo docker pull bbernhard/signal-cli-rest-api:latest >/dev/null 2>&1 \
-        || print_warn "Could not pull signal image (offline?); using cached image if present"
-    sudo docker volume create signal-cli-data >/dev/null 2>&1 || true
-    sudo docker rm -f signal-cli-rest-api >/dev/null 2>&1 || true
-    sudo docker run -d --name signal-cli-rest-api --restart unless-stopped \
-        -e MODE=json-rpc -p 127.0.0.1:8080:8080 \
-        -v signal-cli-data:/home/.local/share/signal-cli \
-        bbernhard/signal-cli-rest-api:latest >/dev/null 2>&1 \
-        || { print_warn "Signal container failed to start"; return; }
+    # QR render helper.
+    sudo apt-get install -y qrencode >/dev/null 2>&1 || true
+    mkdir -p "$SIGNAL_CONFIG_DIR"
 
-    # Wait for the REST API to come up.
-    local ready=false i
-    for i in $(seq 1 30); do
-        if curl -s http://127.0.0.1:8080/v1/about >/dev/null 2>&1; then ready=true; break; fi
-        sleep 2
-    done
-    if [[ "$ready" != true ]]; then
-        print_warn "signal-cli REST API did not become ready; check 'docker logs signal-cli-rest-api'"
-        return
+    # Already linked? (accounts.json lists the registered number.)
+    local already=false
+    if grep -q "$SIGNAL_E164" "$SIGNAL_CONFIG_DIR/data/accounts.json" 2>/dev/null; then
+        already=true
+        print_step "Signal account $SIGNAL_E164 already linked."
     fi
 
-    # Link the device if the account isn't present yet.
-    local accounts
-    accounts=$(curl -s http://127.0.0.1:8080/v1/accounts 2>/dev/null)
-    if [[ "$accounts" == *"$SIGNAL_E164"* ]]; then
-        print_step "Signal account $SIGNAL_E164 already linked."
-    elif [[ "$NON_INTERACTIVE" == "true" ]]; then
-        print_warn "Signal not linked and running non-interactively; skipping QR link."
-        print_warn "Link later: curl 'http://127.0.0.1:8080/v1/qrcodelink?device_name=OpenClaw-Pi5' -o qr.png"
-    else
-        print_step "Device link required - generating QR to scan with the Signal app..."
+    if [[ "$already" != true ]]; then
+        if [[ "$NON_INTERACTIVE" == "true" ]]; then
+            print_warn "Signal not linked and running non-interactively; skipping QR link."
+            print_warn "Link later: signal-cli --config $SIGNAL_CONFIG_DIR link -n OpenClaw-Pi5"
+            return
+        fi
+        print_step "Device link required - starting native signal-cli link..."
+        # signal-cli link prints the device URI on stdout, then blocks until linked.
+        local linklog="/tmp/signal-cli-link.log"
+        : > "$linklog"
+        ( signal-cli --config "$SIGNAL_CONFIG_DIR" link -n "OpenClaw-Pi5" >"$linklog" 2>&1 ) &
+        local link_pid=$!
+        # Wait for the URI to appear.
+        local uri="" i
+        for i in $(seq 1 30); do
+            uri=$(grep -m1 -oE '(sgnl://linkdevice|tsdevice:)[^[:space:]]+' "$linklog" 2>/dev/null)
+            [[ -n "$uri" ]] && break
+            sleep 1
+        done
+        if [[ -z "$uri" ]]; then
+            print_warn "Could not obtain device-link URI; see $linklog"; kill "$link_pid" 2>/dev/null; return
+        fi
+        # Render QR (PNG for the web page + ASCII for the terminal).
+        command -v qrencode >/dev/null 2>&1 && qrencode -o /tmp/signal-link-qr.png "$uri" 2>/dev/null
         write_signal_qr_server
         local TS_IP TS_HOST qr_pid
         TS_IP=$(tailscale ip -4 2>/dev/null | head -1)
-        nohup python3 /usr/local/bin/openclaw-signal-qr.py "${TS_IP:-127.0.0.1}" 8899 \
+        nohup python3 /usr/local/bin/openclaw-signal-qr.py "${TS_IP:-127.0.0.1}" 8899 /tmp/signal-link-qr.png \
             >/tmp/openclaw-signal-qr.log 2>&1 &
         qr_pid=$!
         if [[ -n "$TS_IP" ]]; then
@@ -2585,34 +2632,42 @@ setup_signal_channel() {
             echo "      http://${TS_HOST:-$TS_IP}:8899"
             echo "      Signal app -> Settings -> Linked Devices -> Link New Device -> scan"
         fi
-        # Terminal ASCII QR fallback.
-        curl -s --max-time 20 "http://127.0.0.1:8080/v1/qrcodelink?device_name=OpenClaw-Pi5" \
-            -o /tmp/signal-link-qr.png 2>/dev/null || true
-        if command -v zbarimg >/dev/null 2>&1 && command -v qrencode >/dev/null 2>&1; then
-            local uri
-            uri=$(zbarimg --quiet --raw /tmp/signal-link-qr.png 2>/dev/null | head -1)
-            if [[ -n "$uri" ]]; then echo ""; echo "(Terminal QR fallback:)"; qrencode -t ANSIUTF8 "$uri"; fi
-        fi
-        # Poll for linkage (up to ~5 minutes).
+        command -v qrencode >/dev/null 2>&1 && { echo ""; echo "(Terminal QR fallback:)"; qrencode -t ANSIUTF8 "$uri"; }
+        # Wait for the link command to complete (it exits once associated).
         print_step "Waiting for device link (up to 5 minutes)..."
         local linked=false
         for i in $(seq 1 30); do
-            accounts=$(curl -s http://127.0.0.1:8080/v1/accounts 2>/dev/null)
-            if [[ "$accounts" == *"$SIGNAL_E164"* ]]; then linked=true; break; fi
+            if ! kill -0 "$link_pid" 2>/dev/null; then linked=true; break; fi
             sleep 10
         done
+        wait "$link_pid" 2>/dev/null || true
         kill "$qr_pid" >/dev/null 2>&1 || true
         rm -f /tmp/signal-link-qr.png
-        if [[ "$linked" != true ]]; then
-            print_warn "Signal device not linked within timeout. The container keeps running;"
-            print_warn "re-run this installer or link manually, then restart the gateway."
+        if [[ "$linked" != true ]] || ! grep -q "$SIGNAL_E164" "$SIGNAL_CONFIG_DIR/data/accounts.json" 2>/dev/null; then
+            print_warn "Signal device not linked within timeout. Re-run the installer or link manually:"
+            print_warn "  signal-cli --config $SIGNAL_CONFIG_DIR link -n OpenClaw-Pi5"
             return
         fi
         print_step "Signal linked: $SIGNAL_E164"
     fi
 
-    # Allowlist + channel config (idempotent edit of openclaw.json).
-    print_step "Configuring OpenClaw Signal channel..."
+    # Start the native JSON-RPC daemon on 127.0.0.1:8080.
+    print_step "Starting native signal-cli JSON-RPC daemon (127.0.0.1:8080)..."
+    write_signal_daemon_service "$SIGNAL_E164"
+    sudo systemctl restart signal-cli-daemon.service >/dev/null 2>&1 || true
+    local ready=false i
+    for i in $(seq 1 30); do
+        if curl -s -m 5 -X POST http://127.0.0.1:8080/api/v1/rpc \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","method":"version","id":1}' 2>/dev/null | grep -q '"version"'; then
+            ready=true; break
+        fi
+        sleep 2
+    done
+    [[ "$ready" == true ]] || print_warn "signal-cli daemon did not become ready; check 'journalctl -u signal-cli-daemon'"
+
+    # Allowlist + channel config (idempotent edit of openclaw.json), apiMode=native.
+    print_step "Configuring OpenClaw Signal channel (apiMode=native)..."
     SIGNAL_E164="$SIGNAL_E164" python3 << 'PYCFG'
 import json, os
 p = os.path.expanduser("~/.openclaw/openclaw.json")
@@ -2624,7 +2679,7 @@ if "signal" not in allow: allow.append("signal")
 pl.setdefault("entries", {}).setdefault("signal", {})["enabled"] = True
 sig = cfg.setdefault("channels", {}).setdefault("signal", {})
 sig.update({"enabled": True, "account": num, "httpUrl": "http://127.0.0.1:8080",
-            "apiMode": "container", "autoStart": False, "dmPolicy": "pairing"})
+            "apiMode": "native", "autoStart": False, "dmPolicy": "pairing"})
 with open(p, "w") as f: json.dump(cfg, f, indent=2)
 print("  signal channel configured for", num)
 PYCFG
@@ -2647,9 +2702,9 @@ PYCFG
         openclaw channels status --probe 2>&1 | grep -i signal || true
     OPENCLAW_GATEWAY_URL="ws://${TS_IP:-127.0.0.1}:18789" \
         openclaw message send --channel signal --target "$SIGNAL_E164" \
-        -m "OpenClaw Signal bridge is live." >/dev/null 2>&1 \
+        -m "OpenClaw Signal bridge is live (native signal-cli, no Docker)." >/dev/null 2>&1 \
         && print_step "Test message sent to $SIGNAL_E164 (see 'Note to Self')." \
-        || print_warn "Test send failed; check the gateway and container."
+        || print_warn "Test send failed; check the gateway and signal-cli-daemon."
 
     echo ""
     print_warn "First-time DM senders need approval (dmPolicy=pairing). When someone messages"
@@ -2662,6 +2717,12 @@ PYCFG
 
 setup_matrix_homeserver() {
     print_header "Matrix Homeserver Setup"
+    # Matrix (Synapse) is the one optional component that still needs Docker.
+    if ! command -v docker >/dev/null 2>&1; then
+        print_warn "Matrix homeserver requires Docker, which is not installed."
+        print_warn "Re-run with INSTALL_DOCKER=true to enable it, or use the native Signal channel instead."
+        return
+    fi
     
     # Check if Synapse is already running
     if docker ps | grep -q synapse; then
@@ -2764,23 +2825,20 @@ phase8_rag_setup() {
     RAG_INSTALL_DIR="$HOME/.openclaw/rag"
     RAG_DOCS_SOURCE_FILE="$RAG_INSTALL_DIR/.docs_source"
     
-    # Install Python dependencies
-    print_step "Installing RAG Python dependencies..."
-    sudo apt install -y python3-pip python3-venv
-    
-    # Create RAG directory and virtual environment
+    # Install Python dependencies (system-wide, no venv -> benefits from pip updates)
+    print_step "Installing RAG Python dependencies (no venv)..."
+    sudo apt install -y python3-pip >/dev/null 2>&1 || true
+
+    # Create RAG directories
     mkdir -p "$RAG_INSTALL_DIR"
     mkdir -p "$RAG_DOCS_DIR"
-    
-    python3 -m venv "$RAG_INSTALL_DIR/venv"
-    source "$RAG_INSTALL_DIR/venv/bin/activate"
-    
-    # Install from requirements.txt
+
+    # Install from requirements.txt (system-wide via --break-system-packages)
     if [[ -f "$SCRIPT_DIR/rag/requirements.txt" ]]; then
-        pip install -r "$SCRIPT_DIR/rag/requirements.txt"
+        python3 -m pip install --break-system-packages -r "$SCRIPT_DIR/rag/requirements.txt"
         print_step "RAG dependencies installed"
     else
-        pip install llama-index-core llama-index-embeddings-ollama llama-index-llms-ollama llama-index-vector-stores-chroma chromadb pypdf
+        python3 -m pip install --break-system-packages llama-index-core llama-index-embeddings-ollama llama-index-llms-ollama llama-index-vector-stores-chroma chromadb pypdf
         print_step "RAG dependencies installed"
     fi
     
@@ -2796,7 +2854,7 @@ phase8_rag_setup() {
         print_step "RAG test script installed"
     fi
     
-    deactivate
+    deactivate 2>/dev/null || true
     
     # Pull embedding model
     print_step "Pulling nomic-embed-text embedding model..."
@@ -2866,7 +2924,6 @@ EOF
     cat > "$HOME/.openclaw/rag_query.sh" << 'EOF'
 #!/bin/bash
 set -euo pipefail
-source ~/.openclaw/rag/venv/bin/activate
 set -a
 source ~/.openclaw/rag/.env
 set +a
@@ -2877,7 +2934,6 @@ if [[ "${1:-}" == "--test" ]]; then
 else
   python3 ~/.openclaw/rag/rag_query.py "$@"
 fi
-deactivate
 EOF
     chmod +x "$HOME/.openclaw/rag_query.sh"
     
