@@ -34,7 +34,7 @@ UPSTREAM = "http://127.0.0.1:8000"
 DEFAULT_MODEL_ID = os.environ.get("HAILO_MODEL", "qwen2:1.5b")
 WORKSPACE_SKILLS_DIR = os.path.expanduser("~/.openclaw/workspace/skills")
 MAX_TOOL_DESCRIPTION_CHARS = 120
-MAX_TOOL_COUNT_IN_PROMPT = 8
+MAX_TOOL_COUNT_IN_PROMPT = 10
 UPSTREAM_TIMEOUT = 300  # seconds — generation is slow (~8 tok/s)
 CORS_ALLOWED_ORIGINS = {
     item.strip()
@@ -295,10 +295,49 @@ def _extract_latest_user_text(body_bytes):
 
 
 def _has_explicit_tool_intent(text):
+    """Decide whether to expose tools to the model for this request.
+
+    The small model needs tools enabled to actually read files / run commands.
+    The previous version only matched a handful of literal words (" run ",
+    "execute", ...), so natural requests like "Gib mir alle Dateinamen im Ordner
+    Downloads" fell through and the model just hallucinated. We now also detect
+    filesystem / system-info / shell intent in German and English, plus explicit
+    absolute paths. Pure knowledge questions ("Was ist die Hauptstadt?") still
+    don't match, so they answer directly without tool noise.
+    """
     normalized = f" {str(text or '').strip().lower()} "
     if not normalized.strip():
         return False
-    return any(token in normalized for token in TOOL_INTENT_TOKENS)
+    if any(token in normalized for token in TOOL_INTENT_TOKENS):
+        return True
+    # Filesystem / system / shell intent (substring match is fine here).
+    intent_markers = [
+        # files & directories (DE)
+        "datei", "dateien", "dateiname", "ordner", "verzeichnis", "pfad",
+        # files & directories (EN)
+        "file", "files", "folder", "directory", "directories", "path ",
+        # common locations
+        "downloads", "desktop", "dokumente", "documents", "/home", "/etc",
+        "/var", "/usr", "/tmp", "~/",
+        # list / show / read actions
+        "auflisten", "liste alle", "liste mir", "zeig mir", "zeige mir",
+        "zeig die", "zeige die", "inhalt von", "inhalt des", "lies ", "lese ",
+        "list ", "show me", "read ", "cat ", " ls ",
+        # system info
+        "speicherplatz", "festplatte", "arbeitsspeicher", "speicher frei",
+        "wieviel speicher", "wie viel speicher", "prozesse", "systeminfo",
+        "system info", "disk space", "free memory", "uptime", "cpu-last",
+        "cpu last", "auslastung",
+        # shell / command
+        "befehl", "kommando", "shell", "terminal", "bash", "skript ausführen",
+        "command", "run command",
+    ]
+    if any(m in normalized for m in intent_markers):
+        return True
+    # An absolute or home path anywhere in the text strongly implies file ops.
+    if re.search(r"(^|\s)(/[a-zA-Z0-9._-]+){2,}", str(text or "")):
+        return True
+    return False
 
 
 def model_token_cap(model_id):
@@ -672,9 +711,42 @@ def simplify_messages(messages, tool_prompt=None):
     """Replace OpenClaw's massive system prompt with a minimal one."""
     if not messages:
         return messages
-    # Keep compact conversational context (user+assistant), but drop tool frames
-    # that frequently confuse small local models.
-    convo_msgs = [m for m in messages if m.get("role") in ("user", "assistant")]
+    # Keep conversational context. We also preserve TOOL RESULTS: when the model
+    # emits a tool call, OpenClaw executes it and sends the result back as a
+    # role="tool" message. Small Hailo models don't understand the tool role, so
+    # we fold each result into a plain user message ("Werkzeug-Ergebnis ...") and
+    # render assistant tool-call turns as short text, so the model can read the
+    # data and answer. Without this the file listing would never reach the model.
+    converted = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            result = str(m.get("content", "")).strip()
+            if result:
+                converted.append({
+                    "role": "user",
+                    "content": "Werkzeug-Ergebnis: " + result
+                    + " | Beantworte damit meine vorige Frage in kurzen Saetzen, "
+                    "ohne erneut ein Werkzeug aufzurufen.",
+                })
+        elif role == "assistant":
+            content = str(m.get("content", "") or "").strip()
+            if not content and m.get("tool_calls"):
+                # Pure tool-call turn: summarise so the conversation stays coherent.
+                try:
+                    calls = m.get("tool_calls") or []
+                    names = ", ".join(
+                        c.get("function", {}).get("name", "?") for c in calls
+                    )
+                    content = "(Werkzeug aufgerufen: %s)" % names
+                except Exception:
+                    content = "(Werkzeug aufgerufen)"
+            if content:
+                converted.append({"role": "assistant", "content": content})
+        elif role == "user":
+            converted.append({"role": "user", "content": str(m.get("content", ""))})
+
+    convo_msgs = converted
     if len(convo_msgs) > MAX_HISTORY_MESSAGES:
         convo_msgs = convo_msgs[-MAX_HISTORY_MESSAGES:]
     # Avoid starting context with an assistant reply that has no user prompt.
@@ -707,6 +779,11 @@ def simplify_messages(messages, tool_prompt=None):
         system_content = f"{system_content}\n\n{tool_prompt}"
     if skills_block:
         system_content = f"{system_content}\n\nAvailable skills:\n{skills_block}"
+    # CRITICAL: hailo-ollama's GenAI template crashes (HTTP 500 "Failed to
+    # generate") on raw newlines inside a system message. Flatten to single
+    # line with " | " separators; the JSON tool examples contain no internal
+    # newlines so they survive intact.
+    system_content = _flatten_for_hailo(system_content)
     try:
         with open("/tmp/hailo-proxy-sanitized-system-prompt.txt", "w", encoding="utf-8") as f:
             f.write(system_content)
@@ -716,30 +793,101 @@ def simplify_messages(messages, tool_prompt=None):
     # If other_msgs has history (>1 message), don't include system message
     is_continuation = len(other_msgs) > 1
     if is_continuation:
+        # The system message (and with it the tool instructions) would be
+        # dropped on continuations. Re-inject a compact tool instruction into
+        # the LAST user message so multi-turn conversations keep tool access.
+        if tool_prompt and other_msgs:
+            flat_tool_prompt = _flatten_for_hailo(tool_prompt)
+            for i in range(len(other_msgs) - 1, -1, -1):
+                if other_msgs[i].get("role") == "user":
+                    other_msgs[i] = {
+                        "role": "user",
+                        "content": flat_tool_prompt + " | " + other_msgs[i]["content"],
+                    }
+                    break
         return other_msgs
     return [{"role": "system", "content": system_content}] + other_msgs
+
+
+def _flatten_for_hailo(text):
+    """Collapse newlines to ' | ' so hailo-ollama's template doesn't crash.
+
+    The Hailo GenAI chat template returns HTTP 500 ("Failed to generate") when a
+    message contains raw newline characters. We join lines with a visible
+    separator that preserves structure for the model while staying single-line.
+    """
+    if not text:
+        return text
+    return " | ".join(
+        line.strip() for line in str(text).splitlines() if line.strip()
+    ).strip()
 
 
 def build_tool_prompt(tools_payload):
     if not tools_payload or not isinstance(tools_payload, list):
         return ""
-    lines = [
-        "Tool usage:",
-        "- If a tool is needed, respond ONLY with JSON:",
-        '  {"tool": "<name>", "arguments": { ... }}',
-        "- Otherwise, respond normally.",
-        "Available tools:",
-    ]
-    tool_count = 0
+    # Collect available tool names so we only advertise capabilities that exist.
+    available = set()
     for tool in tools_payload:
-        if not isinstance(tool, dict):
-            continue
-        if tool.get("type") != "function":
-            continue
+        if isinstance(tool, dict) and tool.get("type") == "function":
+            fn = tool.get("function", {})
+            if fn.get("name"):
+                available.add(fn["name"])
+
+    lines = [
+        "WERKZEUGE / TOOLS: Du laeufst auf einem Raspberry Pi und hast ECHTEN "
+        "Zugriff auf das Dateisystem und die Shell ueber die unten gelisteten "
+        "Werkzeuge. Sage NIEMALS, dass du keinen Zugriff auf Dateien oder das "
+        "System hast - rufe stattdessen das passende Werkzeug auf.",
+        "",
+        "So rufst du ein Werkzeug auf - antworte mit GENAU EINER Zeile JSON und "
+        "sonst NICHTS:",
+        '  {"tool": "<name>", "arguments": { ... }}',
+        "",
+    ]
+    # Concrete, high-value examples for the most common filesystem tasks. Only
+    # show examples for tools that are actually available.
+    examples = []
+    if "exec" in available:
+        examples.append(
+            'Frage "Welche Dateien sind in /home/pi/Downloads?" '
+            '-> {"tool": "exec", "arguments": {"command": "ls -1 /home/pi/Downloads"}}'
+        )
+        examples.append(
+            'Frage "Wie viel Speicher ist frei?" '
+            '-> {"tool": "exec", "arguments": {"command": "df -h"}}'
+        )
+    if "read" in available:
+        examples.append(
+            'Frage "Zeige den Inhalt von /etc/hostname" '
+            '-> {"tool": "read", "arguments": {"file_path": "/etc/hostname"}}'
+        )
+    if examples:
+        lines.append("BEISPIELE:")
+        lines.extend("  " + e for e in examples)
+        lines.append("")
+    lines.append("REGEL: Bei Fragen zu Dateien, Ordnern, Verzeichnissen, "
+                 "Systeminfo, Prozessen oder dem Ausfuehren von Befehlen MUSST "
+                 "du ein Werkzeug aufrufen. Bei normalen Wissensfragen antworte "
+                 "direkt ohne Werkzeug.")
+    lines.append("")
+    lines.append("Verfuegbare Werkzeuge:")
+    # Prioritise the high-value filesystem/shell tools so they survive the
+    # MAX_TOOL_COUNT_IN_PROMPT truncation (OpenClaw sends ~27 tools).
+    priority = ["exec", "read", "write", "edit", "process", "web_search", "web_fetch"]
+    func_tools = [
+        t for t in tools_payload
+        if isinstance(t, dict) and t.get("type") == "function"
+        and t.get("function", {}).get("name")
+    ]
+    func_tools.sort(
+        key=lambda t: priority.index(t["function"]["name"])
+        if t["function"]["name"] in priority else len(priority)
+    )
+    tool_count = 0
+    for tool in func_tools:
         fn = tool.get("function", {})
         name = fn.get("name")
-        if not name:
-            continue
         desc = fn.get("description", "").strip().replace("\n", " ")
         if len(desc) > MAX_TOOL_DESCRIPTION_CHARS:
             desc = desc[:MAX_TOOL_DESCRIPTION_CHARS].rstrip() + "..."
