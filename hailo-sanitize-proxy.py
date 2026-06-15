@@ -93,25 +93,35 @@ TRACE_ENABLED = os.environ.get("HAILO_PROXY_TRACE", "1").strip().lower() not in 
 }
 TRACE_DIR = os.environ.get("HAILO_PROXY_TRACE_DIR", "/tmp/hailo-proxy-traces")
 TRACE_MAX_BYTES = _env_int("HAILO_PROXY_TRACE_MAX_BYTES", 250000)
-# TUNING (verified on Pi5 + Hailo 5.3.0, qwen3:1.7b) — ALL values overridable
-# via environment variables (see /etc/hailo-proxy.env). Local Hailo inference is
-# free and unlimited; these caps exist ONLY to (a) bound latency (~8 tok/s, so
-# 384 tok ~= 48s) and (b) stop small 1-2B models degenerating into repetition
-# loops on long generations. Raise them if you prefer longer answers over speed.
-#  - frequency_penalty / presence_penalty were tested and HURT this small model
-#    (produced broken loops like 'der Prozyn der Prozyn...'), so they stay unset.
-#  - temperature 0.15 / top_p 0.85 give correct, stable factual answers.
-MAX_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_MAX_TOKENS", 192)
-CODE_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_CODE_TOKENS", 512)
-CODE_MIN_COMPLETION_TOKENS = _env_int("HAILO_PROXY_CODE_MIN_TOKENS", 384)
-WEB_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_WEB_TOKENS", 96)
-DEFAULT_PROXY_COMPLETION_TOKENS = _env_int("HAILO_PROXY_DEFAULT_TOKENS", 128)
-MAX_HISTORY_MESSAGES = _env_int("HAILO_PROXY_MAX_HISTORY_MESSAGES", 4)
-MAX_MESSAGE_CONTENT_CHARS = _env_int("HAILO_PROXY_MAX_MESSAGE_CHARS", 1200)
-# Sampling. Defaults stay conservative for factual stability; override to taste.
-PROXY_TEMPERATURE = _env_float("HAILO_PROXY_TEMPERATURE", 0.15)
-PROXY_TEMPERATURE_MAX = _env_float("HAILO_PROXY_TEMPERATURE_MAX", 0.6)
-PROXY_TOP_P = _env_float("HAILO_PROXY_TOP_P", 0.85)
+# ════════════════════════════════════════════════════════════════════════════
+# TUNING — HARTE PARAMETER. Direkt hier im Skript editieren (kein venv, kein env).
+# Nach Änderung:  sudo systemctl restart hailo-sanitize-proxy.service
+# Verifiziert auf Pi5 + Hailo 5.3.0, qwen3:1.7b. Lokale Hailo-Inferenz ist gratis
+# und unbegrenzt; die Token-Caps begrenzen NUR Latenz (~8 tok/s) und verhindern,
+# dass kleine 1-2B-Modelle in Wiederhol-Loops kippen.
+#
+# Unsere Defaults (konservativ, faktenstabil):
+#     temperature 0.15 / top_p 0.85 / top_k aus / penalties aus
+# Zum Vergleich die jordanskole/hailo-node-Werte (einfach hier eintragen):
+#     PROXY_TEMPERATURE=0.7  PROXY_TOP_P=0.8  PROXY_TOP_K=20
+#     PROXY_FREQUENCY_PENALTY=1.1  MAX_PROXY_COMPLETION_TOKENS=1024
+#     CODE/WEB/DEFAULT_*=1024  MAX_HISTORY_MESSAGES=40
+# ────────────────────────────────────────────────────────────────────────────
+# Token-Budgets (Output) je Aufgabentyp:
+MAX_PROXY_COMPLETION_TOKENS = 192      # Chat-Obergrenze
+CODE_PROXY_COMPLETION_TOKENS = 512     # Code-Obergrenze
+CODE_MIN_COMPLETION_TOKENS = 384       # Code-Untergrenze (nie weniger)
+WEB_PROXY_COMPLETION_TOKENS = 96       # web-gegroundete Antworten (knapp)
+DEFAULT_PROXY_COMPLETION_TOKENS = 128  # Fallback ohne max_tokens
+MAX_HISTORY_MESSAGES = 4               # behaltene Verlaufs-Nachrichten
+MAX_MESSAGE_CONTENT_CHARS = 1200       # max. Zeichen je Nachricht
+# Sampling:
+PROXY_TEMPERATURE = 0.15               # Standard-Temperatur
+PROXY_TEMPERATURE_MAX = 0.6            # Deckel, falls Client höher schickt
+PROXY_TOP_P = 0.85                     # nucleus sampling
+PROXY_TOP_K = 0                        # 0 = aus (nicht an Modell senden)
+PROXY_FREQUENCY_PENALTY = 0.0          # 0 = aus (schadet kleinem Modell)
+PROXY_PRESENCE_PENALTY = 0.0           # 0 = aus
 # Feature toggles.
 WEB_SEARCH_ENABLED = os.environ.get("HAILO_PROXY_WEB_SEARCH", "1").strip().lower() not in {
     "0", "false", "no", "off"
@@ -136,7 +146,7 @@ MINIMAL_SYSTEM_PROMPT = (
 )
 
 ALLOWED_CHAT_FIELDS = {
-    "model", "messages", "temperature", "top_p", "n", "stream",
+    "model", "messages", "temperature", "top_p", "top_k", "n", "stream",
     "max_tokens", "max_completion_tokens", "presence_penalty",
     "frequency_penalty", "seed", "tools", "tool_choice",
     "parallel_tool_calls",
@@ -706,6 +716,14 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     if not isinstance(top_p, (int, float)):
         top_p = PROXY_TOP_P
     sanitized["top_p"] = max(0.7, min(float(top_p), 0.95))
+
+    # Optionale Sampling-Regler (harte Parameter oben; 0 = aus, nicht senden).
+    if PROXY_TOP_K > 0:
+        sanitized["top_k"] = PROXY_TOP_K
+    if PROXY_FREQUENCY_PENALTY:
+        sanitized["frequency_penalty"] = PROXY_FREQUENCY_PENALTY
+    if PROXY_PRESENCE_PENALTY:
+        sanitized["presence_penalty"] = PROXY_PRESENCE_PENALTY
 
     if "messages" in sanitized:
         tool_prompt = build_tool_prompt(tools_payload)
