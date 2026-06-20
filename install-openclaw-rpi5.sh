@@ -2192,6 +2192,107 @@ phase4_deploy_config() {
         fi
         print_step "Customized AGENTS.md with your preferences"
     fi
+
+    setup_named_agents
+}
+
+# Define two named agents: "main" (generalist, qwen3:1.7b) and "fixer"
+# (review/repair, qwen2.5-coder:1.5b). The fixer reviews and improves the main
+# agent's outputs/configs/code. Idempotent: writes the fixer workspace +
+# instructions and patches agents.list via the validated config patcher. To use
+# a stronger cloud model for repair later, add a provider+key and change the
+# fixer's model.primary to e.g. "anthropic/claude-..." then restart the gateway.
+setup_named_agents() {
+    print_header "Configure named agents (main + fixer)"
+    local provider="${HAILO_PROVIDER_ID:-hailo}"
+    local fixer_ws="$HOME/.openclaw/workspace-fixer"
+    local fixer_dir="$HOME/.openclaw/agents/fixer"
+    mkdir -p "$fixer_ws" "$fixer_dir"
+
+    cat > "$fixer_dir/.instructions.md" << 'FIXEREOF'
+# Fixer-Agent — Reviewer & Reparatur
+
+Du bist **Fixer**, ein präziser Review- und Reparatur-Agent auf einem Raspberry Pi 5.
+Modell: `hailo/qwen2.5-coder:1.5b` (lokal, code-/struktur-spezialisiert).
+
+## Deine Aufgabe
+
+Du bekommst Ergebnisse, Konfigurationen, Prompts oder Code, die der Agent **`main`**
+(`hailo/qwen3:1.7b`) erzeugt hat. Prüfe und **verbessere/repariere** sie.
+
+## Arbeitsweise
+
+1. Lies die Eingabe genau. Benenne kurz, **was** falsch oder schwach ist.
+2. Liefere die **korrigierte Version** — konkret und vollständig, nicht nur Hinweise.
+3. Bei Code/Config: gib lauffähige, vollständige Blöcke aus. Keine Platzhalter.
+4. Bei Antworten von `main`: korrekt, knapp, faktisch. Entferne Halluzinationen,
+   erfundene Pfade/Zahlen und Wiederholungen.
+5. Ist etwas bereits korrekt, sag das klar und ändere nichts.
+
+## Stil
+
+- Sprache des Nutzers (Default: Deutsch). Erst Diagnose (1-2 Sätze), dann Lösung.
+- Keine rohen Werkzeug-JSON-Blöcke im Text. Werkzeug nötig? Rufe es auf.
+- Erfinde nichts. Fehlt Information, sag es und nenne, was du brauchst.
+FIXEREOF
+
+    cat > "$fixer_ws/AGENTS.md" << 'FIXEREOF'
+# Fixer-Workspace
+
+Arbeitsbereich des **Fixer**-Agenten (Review & Reparatur).
+Fixer prüft und repariert Outputs des `main`-Agenten (`hailo/qwen3:1.7b`).
+Modell: `hailo/qwen2.5-coder:1.5b`.
+
+## Prinzipien
+- Erst Diagnose, dann konkrete, vollständige Korrektur.
+- Lauffähiger Code/Config, keine Platzhalter.
+- Keine Halluzinationen; fehlt Information, klar benennen.
+- Sprache des Nutzers (Default: Deutsch), knapp und faktisch.
+FIXEREOF
+
+    cat > "$fixer_ws/IDENTITY.md" << 'FIXEREOF'
+# IDENTITY.md - Fixer
+
+- **Name:** Fixer
+- **Creature:** Review- und Reparatur-Agent (code-spezialisiert)
+- **Vibe:** präzise, knapp, sachlich
+- **Emoji:** 🔧
+- **Modell:** hailo/qwen2.5-coder:1.5b
+FIXEREOF
+
+    local agents_patch
+    agents_patch=$(cat << PATCHEOF
+{
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "default": true,
+        "name": "Main",
+        "description": "Generalist, lokal auf Hailo-NPU.",
+        "workspace": "$OPENCLAW_WORKSPACE",
+        "agentDir": "$HOME/.openclaw/agents/main",
+        "model": { "primary": "$provider/qwen3:1.7b" }
+      },
+      {
+        "id": "fixer",
+        "default": false,
+        "name": "Fixer",
+        "description": "Review- und Reparatur-Agent. Verbessert Outputs/Configs/Code des main-Agenten.",
+        "workspace": "$fixer_ws",
+        "agentDir": "$fixer_dir",
+        "model": { "primary": "$provider/qwen2.5-coder:1.5b" }
+      }
+    ]
+  }
+}
+PATCHEOF
+)
+    if printf '%s' "$agents_patch" | openclaw config patch --stdin >/dev/null 2>&1; then
+        print_step "Named agents configured: main (qwen3:1.7b) + fixer (qwen2.5-coder:1.5b)"
+    else
+        print_warn "Could not patch agents.list; check 'openclaw config validate'"
+    fi
 }
 
 ensure_openclaw_boot_autostart() {
