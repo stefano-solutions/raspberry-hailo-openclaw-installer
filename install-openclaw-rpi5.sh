@@ -1564,7 +1564,7 @@ phase3_openclaw_install() {
 {
   "gateway": {
     "mode": "local",
-    "bind": "tailnet",
+    "bind": "lan",
     "controlUi": {
       "allowInsecureAuth": true,
       "allowedOrigins": [
@@ -2206,7 +2206,9 @@ ensure_openclaw_boot_autostart() {
     sudo systemctl enable unified-chat-facade.service 2>/dev/null || true
 
     # OpenClaw gateway is a user service; with linger it can boot without login.
-    # Force explicit --bind tailnet in the unit to avoid fallback to loopback.
+    # Bind mode "lan" (0.0.0.0) so BOTH the local TUI (127.0.0.1) and remote
+    # Tailscale clients (MacBook) can connect. "tailnet" alone breaks the TUI,
+    # "loopback"/"auto" alone breaks remote access. Token auth gates all access.
     local gateway_unit="$HOME/.config/systemd/user/openclaw-gateway.service"
     systemctl --user daemon-reload 2>/dev/null || true
     if systemctl --user list-unit-files 2>/dev/null | grep -q '^openclaw-gateway.service'; then
@@ -2222,11 +2224,14 @@ ensure_openclaw_boot_autostart() {
     fi
 
     if [[ -f "$gateway_unit" ]]; then
-        # Ensure --bind tailnet flag is present in ExecStart
+        # Ensure --bind lan flag is present in ExecStart (loopback + tailnet)
         if grep -q ' gateway --port 18789$' "$gateway_unit"; then
-            sed -i 's| gateway --port 18789$| gateway --port 18789 --bind tailnet|' "$gateway_unit"
+            sed -i 's| gateway --port 18789$| gateway --port 18789 --bind lan|' "$gateway_unit"
         elif grep -q ' gateway --port 18789 ' "$gateway_unit" && ! grep -q -- '--bind' "$gateway_unit"; then
-            sed -i 's| gateway --port 18789 | gateway --port 18789 --bind tailnet |' "$gateway_unit"
+            sed -i 's| gateway --port 18789 | gateway --port 18789 --bind lan |' "$gateway_unit"
+        else
+            # Migrate any older explicit --bind tailnet/auto/loopback to lan
+            sed -i 's|--bind \(tailnet\|auto\|loopback\)|--bind lan|' "$gateway_unit"
         fi
 
         # Add ExecStartPre to wait for Tailscale IP (fixes race condition on boot)
