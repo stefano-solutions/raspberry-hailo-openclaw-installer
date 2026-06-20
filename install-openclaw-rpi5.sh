@@ -2295,6 +2295,30 @@ PATCHEOF
     fi
 }
 
+# OPTIONAL: install the bounded 24h auto-optimizer ("fixer" self-tuner).
+# It runs one benchmark cycle every 30 min for 24h, trying whitelisted numeric
+# generation parameters within safe bounds, keeps a candidate only if it beats
+# the current best benchmark score (with backup+healthcheck+rollback each step),
+# and posts a Signal update to the owner on every improvement. It never edits
+# arbitrary code and never auto-pushes to GitHub. NOT enabled by default — it is
+# a one-time tuning run, not a permanent service. Enable manually:
+#   systemctl --user enable --now fixer-optimizer.timer
+install_fixer_optimizer() {
+    print_header "Install fixer auto-optimizer (optional, not auto-started)"
+    local opt_dir="$HOME/fixer-optimizer"
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$opt_dir" "$unit_dir"
+    if [[ -f "$SCRIPT_DIR/scripts/fixer-optimizer.py" ]]; then
+        cp "$SCRIPT_DIR/scripts/fixer-optimizer.py" "$opt_dir/optimizer.py"
+        cp "$SCRIPT_DIR/templates/fixer-optimizer.service" "$unit_dir/fixer-optimizer.service"
+        cp "$SCRIPT_DIR/templates/fixer-optimizer.timer" "$unit_dir/fixer-optimizer.timer"
+        systemctl --user daemon-reload 2>/dev/null || true
+        print_step "Optimizer installed at $opt_dir/optimizer.py (enable: systemctl --user enable --now fixer-optimizer.timer)"
+    else
+        print_warn "scripts/fixer-optimizer.py not found; skipping optimizer install"
+    fi
+}
+
 ensure_openclaw_boot_autostart() {
     print_header "Ensuring Boot Autostart"
 

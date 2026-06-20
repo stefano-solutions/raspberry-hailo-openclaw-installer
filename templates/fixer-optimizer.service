@@ -1,0 +1,11 @@
+[Unit]
+Description=Fixer-Optimizer — bounded 24h auto-tuner for the OpenClaw main agent
+After=openclaw-gateway.service hailo-sanitize-proxy.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/pi
+Environment=PATH=/home/pi/.npm-global/bin:/usr/local/bin:/home/pi/.local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/pi/fixer-optimizer/optimizer.py
+# One benchmark cycle can take several minutes (NPU-bound agent turns).
+TimeoutStartSec=1800

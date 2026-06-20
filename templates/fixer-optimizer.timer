@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Fixer-Optimizer every 30 min (self-stops after 24h)
+
+[Timer]
+OnActiveSec=30s
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

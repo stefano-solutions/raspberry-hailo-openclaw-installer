@@ -356,6 +356,38 @@ sudo n stable && hash -r && node -v
 sudo usermod -aG docker $USER && newgrp docker
 ```
 
+## Named agents (main + fixer) and the optional auto-optimizer
+
+The installer defines two named agents:
+
+- **main** — generalist, `hailo/qwen3:1.7b` (the default agent you chat with).
+- **fixer** — review/repair, `hailo/qwen2.5-coder:1.5b`. It reviews and improves
+  the main agent's outputs, configs and the proxy's tuning.
+
+### Bounded 24h auto-optimizer (opt-in)
+
+`scripts/fixer-optimizer.py` is a safe, bounded self-tuner driven by the fixer
+concept. Once every 30 minutes (for 24h) it:
+
+1. picks a candidate set of **whitelisted numeric generation parameters** (temperature,
+   top_p, top_k, frequency penalty, history length, token caps) within safe bounds,
+2. backs up the live proxy, applies the candidate, restarts and **health-checks** it
+   (rolling back immediately if unhealthy),
+3. runs a 4-case benchmark (code, file-tool, knowledge, length) and scores it,
+4. keeps the candidate only if it **beats the current best**, otherwise rolls back,
+5. on every improvement syncs the winning proxy into the repo working copy (it does
+   **not** auto-commit/push) and posts a **Signal** update to the owner.
+
+After 24h it sends a final summary and disables its own timer. It never edits
+arbitrary code. Install (not auto-started) is wired via `install_fixer_optimizer`;
+enable a run manually:
+
+```bash
+systemctl --user enable --now fixer-optimizer.timer
+journalctl --user -u fixer-optimizer.service -f      # watch
+tail -f ~/fixer-optimizer/optimizer.log              # cycle log
+```
+
 ## Project layout
 
 ```text
@@ -363,10 +395,13 @@ openclaw-raspberry-installer/
 ├── install-openclaw-rpi5.sh
 ├── scripts/
 │   ├── test_tools_over_ssh.sh
-│   └── test_claw_flavors_over_ssh.sh
+│   ├── test_claw_flavors_over_ssh.sh
+│   └── fixer-optimizer.py
 ├── templates/
 │   ├── unified-chat-facade.html
 │   ├── UNIFIED_CHAT_FACADE.md
+│   ├── fixer-optimizer.service
+│   ├── fixer-optimizer.timer
 │   └── (generated) unified-chat-runtime.json
 ├── molt_tools/
 ├── rag/
