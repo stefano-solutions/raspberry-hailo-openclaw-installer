@@ -68,75 +68,38 @@ ALLOWED_HOSTS.update({
 })
 
 
-def _env_int(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-TRACE_ENABLED = os.environ.get("HAILO_PROXY_TRACE", "1").strip().lower() not in {
-    "0", "false", "no", "off"
-}
-TRACE_DIR = os.environ.get("HAILO_PROXY_TRACE_DIR", "/tmp/hailo-proxy-traces")
-TRACE_MAX_BYTES = _env_int("HAILO_PROXY_TRACE_MAX_BYTES", 250000)
+TRACE_ENABLED = True
+TRACE_DIR = "/tmp/hailo-proxy-traces"
+TRACE_MAX_BYTES = 250000
 # ════════════════════════════════════════════════════════════════════════════
-# TUNING — HARTE PARAMETER. Direkt hier im Skript editieren (kein venv, kein env).
+# TUNING — HARTE PARAMETER. Direkt hier editieren (kein venv, kein env).
 # Nach Änderung:  sudo systemctl restart hailo-sanitize-proxy.service
-# Verifiziert auf Pi5 + Hailo 5.3.0, qwen3:1.7b. Lokale Hailo-Inferenz ist gratis
-# und unbegrenzt; die Token-Caps begrenzen NUR Latenz (~8 tok/s) und verhindern,
-# dass kleine 1-2B-Modelle in Wiederhol-Loops kippen.
+# Verifiziert auf Pi5 + Hailo 5.3.0, qwen3:1.7b.
 #
-# Unsere Defaults (konservativ, faktenstabil):
-#     temperature 0.15 / top_p 0.85 / top_k aus / penalties aus
-# Zum Vergleich die jordanskole/hailo-node-Werte (einfach hier eintragen):
-#     PROXY_TEMPERATURE=0.7  PROXY_TOP_P=0.8  PROXY_TOP_K=20
-#     PROXY_FREQUENCY_PENALTY=1.1  MAX_PROXY_COMPLETION_TOKENS=1024
-#     CODE/WEB/DEFAULT_*=1024  MAX_HISTORY_MESSAGES=40
+# Lokale Hailo-Inferenz ist gratis und unbegrenzt → wir geben dem Modell mehr
+# Output-Budget und mehr Kontext als die ursprünglichen Defaults. ABER: qwen3:1.7b
+# läuft im Reasoning-Modus bei ~10 tok/s; ein zu großes Token-Budget bedeutet, dass
+# generative/Code-Aufgaben das Budget mit "Denken" füllen und 2-5 Min brauchen.
+# Diese Caps sind die nutzbare Obergrenze (Worst-Case ~100-150s); bei EOS stoppt das
+# Modell meist deutlich früher, kurze Faktenantworten kommen in 1-3s.
+# Sampling konservativ (temp 0.15, top_p 0.9, kein top_k/penalty) = bestes,
+# faktenstabilstes Verhalten für kleine 1-2B-Modelle (datengestützt ermittelt).
 # ────────────────────────────────────────────────────────────────────────────
-# Token-Budgets (Output) je Aufgabentyp:
-MAX_PROXY_COMPLETION_TOKENS = 1024     # Chat-Obergrenze  [hailo-node]
-CODE_PROXY_COMPLETION_TOKENS = 1024    # Code-Obergrenze  [hailo-node]
-CODE_MIN_COMPLETION_TOKENS = 384       # Code-Untergrenze (nie weniger)
-WEB_PROXY_COMPLETION_TOKENS = 1024     # web-gegroundete Antworten  [hailo-node]
-DEFAULT_PROXY_COMPLETION_TOKENS = 1024 # Fallback ohne max_tokens  [hailo-node]
-MAX_HISTORY_MESSAGES = 40              # behaltene Verlaufs-Nachrichten  [hailo-node]
-MAX_MESSAGE_CONTENT_CHARS = 1200       # max. Zeichen je Nachricht
-# Sampling:
-PROXY_TEMPERATURE = 0.7                # Standard-Temperatur  [hailo-node]
-PROXY_TEMPERATURE_MAX = 0.7            # Deckel, falls Client höher schickt
-PROXY_TOP_P = 0.8                      # nucleus sampling  [hailo-node]
-PROXY_TOP_K = 20                       # top_k  [hailo-node]
-PROXY_FREQUENCY_PENALTY = 1.1          # frequency_penalty  [hailo-node]
-PROXY_PRESENCE_PENALTY = 0.0           # 0 = aus
+# Token-Budgets (Output-Obergrenzen) je Aufgabentyp:
+MAX_PROXY_COMPLETION_TOKENS = 1024      # Chat-Obergrenze (EOS stoppt meist früher)
+CODE_PROXY_COMPLETION_TOKENS = 1536     # Code darf etwas länger werden
+CODE_MIN_COMPLETION_TOKENS = 384        # Code-Untergrenze (nie weniger)
+WEB_PROXY_COMPLETION_TOKENS = 384       # web-gegroundete Antworten (kurz & faktisch)
+DEFAULT_PROXY_COMPLETION_TOKENS = 1024  # Fallback ohne max_tokens
+# Kontext (Eingabe): mehr Verlauf behalten, längere Nachrichten zulassen.
+MAX_HISTORY_MESSAGES = 20               # behaltene Verlaufs-Nachrichten
+MAX_MESSAGE_CONTENT_CHARS = 3000        # max. Zeichen je Nachricht
+# Sampling (konservativ, hart):
+PROXY_TEMPERATURE = 0.15                # Standard-Temperatur
+PROXY_TOP_P = 0.9                       # nucleus sampling
 # Feature toggles.
-WEB_SEARCH_ENABLED = os.environ.get("HAILO_PROXY_WEB_SEARCH", "1").strip().lower() not in {
-    "0", "false", "no", "off"
-}
-COLLAPSE_REPETITION_ENABLED = os.environ.get(
-    "HAILO_PROXY_COLLAPSE_REPETITION", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-MODEL_TOKEN_CAPS = {
-    "qwen3:1.7b": 1024,
-    "qwen2.5-coder:1.5b": 1024,
-    "qwen2.5:1.5b": 1024,
-    "qwen2:1.5b": 1024,
-    "llama3.2:1b": 1024,
-    "deepseek_r1:1.5b": 1024,
-}
+WEB_SEARCH_ENABLED = True
+COLLAPSE_REPETITION_ENABLED = True
 _TRACE_SEQ = itertools.count(1)
 
 MINIMAL_SYSTEM_PROMPT = (
@@ -355,11 +318,6 @@ def _has_explicit_tool_intent(text):
     if re.search(r"(^|\s)(/[a-zA-Z0-9._-]+){2,}", str(text or "")):
         return True
     return False
-
-
-def model_token_cap(model_id):
-    key = str(model_id or "").strip().lower()
-    return MODEL_TOKEN_CAPS.get(key, MAX_PROXY_COMPLETION_TOKENS)
 
 
 def _write_trace(trace_id, suffix, body_bytes):
@@ -686,17 +644,13 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     if requested_tokens <= 1:
         requested_tokens = DEFAULT_PROXY_COMPLETION_TOKENS
 
-    model_id = sanitized.get("model")
-    per_model_cap = model_token_cap(model_id)
     proxy_cap = MAX_PROXY_COMPLETION_TOKENS
     # Coding tasks need more room so functions/classes aren't truncated. Raise
-    # BOTH the per-model and the global proxy ceiling, and apply a sensible
-    # floor so a stingy client max_tokens can't truncate code either.
+    # the ceiling and apply a floor so a stingy client max_tokens can't truncate.
     if is_code_task(clean_query):
         proxy_cap = CODE_PROXY_COMPLETION_TOKENS
-        per_model_cap = max(per_model_cap, CODE_PROXY_COMPLETION_TOKENS)
         requested_tokens = max(requested_tokens, CODE_MIN_COMPLETION_TOKENS)
-    sanitized["max_tokens"] = min(requested_tokens, per_model_cap, proxy_cap)
+    sanitized["max_tokens"] = min(requested_tokens, proxy_cap)
     # Web-grounded answers: the useful fact is in the first 1-2 sentences. Cap
     # tighter so the small model stops before it degenerates into number loops
     # ("1. Halbzeit, 2., 3., ..."). collapse_repetition cleans the rest.
@@ -707,23 +661,9 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     if isinstance(sanitized.get("n"), int) and sanitized["n"] > 1:
         sanitized["n"] = 1
 
-    temperature = sanitized.get("temperature")
-    if not isinstance(temperature, (int, float)):
-        temperature = PROXY_TEMPERATURE
-    sanitized["temperature"] = max(0.0, min(float(temperature), PROXY_TEMPERATURE_MAX))
-
-    top_p = sanitized.get("top_p")
-    if not isinstance(top_p, (int, float)):
-        top_p = PROXY_TOP_P
-    sanitized["top_p"] = max(0.7, min(float(top_p), 0.95))
-
-    # Optionale Sampling-Regler (harte Parameter oben; 0 = aus, nicht senden).
-    if PROXY_TOP_K > 0:
-        sanitized["top_k"] = PROXY_TOP_K
-    if PROXY_FREQUENCY_PENALTY:
-        sanitized["frequency_penalty"] = PROXY_FREQUENCY_PENALTY
-    if PROXY_PRESENCE_PENALTY:
-        sanitized["presence_penalty"] = PROXY_PRESENCE_PENALTY
+    # Hard sampling params (deterministic, fact-stable for small models).
+    sanitized["temperature"] = PROXY_TEMPERATURE
+    sanitized["top_p"] = PROXY_TOP_P
 
     if "messages" in sanitized:
         tool_prompt = build_tool_prompt(tools_payload)
