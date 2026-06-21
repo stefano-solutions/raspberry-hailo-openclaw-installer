@@ -456,6 +456,8 @@ def should_trigger_web_search(user_message):
     return False
 
 
+# === WEBSEARCH-BLOCK-START (managed region; the Gemini case_fixer may rewrite
+# everything between these sentinels — keep them on their own lines, unchanged) ===
 _SEARCH_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"
@@ -670,6 +672,8 @@ def perform_web_search(query):
             )
             sys.stderr.flush()
     return None
+# === WEBSEARCH-BLOCK-END ===
+
 
 def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     """Strip unsupported fields from /v1/chat/completions request."""
