@@ -1234,11 +1234,47 @@ def collapse_repetition(text):
     return "".join(rebuilt).strip()
 
 
+def estimate_prompt_tokens(original_body):
+    """Estimate real prompt tokens from the conversation the client actually sent.
+
+    hailo-ollama always reports a bogus prompt_tokens=100, which freezes the
+    client's context meter. We compute a ~chars/4 estimate over all message
+    contents (plus any tool definitions) so the context usage reflects reality.
+    """
+    try:
+        payload = json.loads(original_body)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    total_chars = 0
+    for msg in payload.get("messages", []) or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    total_chars += len(str(part.get("text", "")))
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            total_chars += len(json.dumps(tcs))
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        total_chars += len(json.dumps(tools))
+    if total_chars <= 0:
+        return None
+    return max(1, total_chars // 4)
+
+
 def sanitize_response(
     data,
     allowed_tool_names=None,
     tool_calls_enabled=True,
     latest_user_text="",
+    prompt_tokens=None,
 ):
     """Fix hailo-ollama response for OpenAI SDK compatibility."""
     try:
@@ -1302,13 +1338,19 @@ def sanitize_response(
                     }
                 ]
 
-    if "usage" not in resp:
-        est_tokens = max(1, total_chars // 4)
-        resp["usage"] = {
-            "prompt_tokens": 100,
-            "completion_tokens": est_tokens,
-            "total_tokens": 100 + est_tokens,
-        }
+    usage = resp.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    # hailo-ollama always reports a bogus prompt_tokens=100; overwrite it with a
+    # real estimate so the client's context meter reflects the true conversation.
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    elif "prompt_tokens" not in usage:
+        usage["prompt_tokens"] = 100
+    if "completion_tokens" not in usage:
+        usage["completion_tokens"] = max(1, total_chars // 4)
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    resp["usage"] = usage
 
     return json.dumps(resp).encode("utf-8")
 
@@ -1719,6 +1761,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     allowed_tool_names=allowed_tool_names,
                     tool_calls_enabled=allow_tool_calls,
                     latest_user_text=latest_user_text,
+                    prompt_tokens=estimate_prompt_tokens(original_body),
                 )
             if is_completion:
                 data = convert_chat_to_completion(data)
