@@ -462,15 +462,116 @@ _SEARCH_UA = (
 )
 
 
+_SEARCH_STOPWORDS = {
+    "suche", "such", "im", "internet", "netz", "online", "nach", "gib", "gibt",
+    "die", "den", "das", "der", "und", "in", "zeilen", "aus", "mir", "bitte",
+    "mal", "nun", "dann", "etwas", "finde", "heraus", "schau", "recherchiere",
+    "recherche", "google", "ein", "eine", "einen", "auf", "liste", "zeig",
+    "zeige", "ist", "sind", "was", "wie", "wo", "ob", "search", "the", "web",
+    "for", "look", "up", "find", "out", "me", "please", "a", "an", "of",
+}
+
+
+def _to_search_query(text):
+    """Reduce a verbose natural-language request to keyword search terms.
+
+    Search engines rank concise keyword queries far better than full sentences
+    ("Suche im Internet nach den heutigen Fussball ... und gib ... aus" buries
+    the data pages). We drop filler/command words but always keep capitalised
+    tokens (proper nouns) and longer content words. Falls back to the original.
+    """
+    tokens = re.findall(r"[\wäöüÄÖÜß.-]+", str(text or ""))
+    kept = []
+    for tok in tokens:
+        low = tok.lower().strip(".-")
+        if len(low) <= 2 or low in _SEARCH_STOPWORDS:
+            continue
+        kept.append(tok)
+    query = " ".join(kept).strip()
+    return query if len(query) >= 3 else str(text or "").strip()
+
+
+def _extract_pairings(text):
+    """Extract clean 'HH:MM Uhr: Team - Team' fixtures from page text.
+
+    A real match-schedule entry carries a kickoff time immediately before the
+    pairing, e.g. '18:00 Uhr: Spanien - Saudi-Arabien (Gruppe H, Atlanta)' or
+    '21:00 Uhr: Kanada gegen Bosnien-Herzegowina'. Requiring the time prefix
+    separates true fixtures from article asides/nav crumbs.
+
+    Separators are matched ONLY when surrounded by spaces (' - ', ' gegen ',
+    ' vs '), so hyphenated country names ('Bosnien-Herzegowina', 'Saudi-Arabien')
+    are never split, and the lowercase 'gegen' can't be absorbed into a team name
+    (each team word must start with a capital letter).
+    """
+    name = r"[A-ZÄÖÜ][\wäöüß.-]*(?:\s[A-ZÄÖÜ][\wäöüß.-]+){0,2}"
+    sep = r"(?:\s+gegen\s+|\s+vs\.?\s+|\s+[–-]\s+)"
+    pat = re.compile(
+        r"(\d{1,2}[:.]\d{2})\s*Uhr[:\s]+(%s)%s(%s)\s*(\([^)]{2,40}\))?"
+        % (name, sep, name)
+    )
+    out = []
+    for m in pat.finditer(text):
+        t, a, b, paren = m.groups()
+        a, b = a.strip(), b.strip()
+        if any(ch.isdigit() for ch in a + b) or len(a) < 3 or len(b) < 3:
+            continue
+        line = "%s Uhr: %s - %s" % (t, a, b)
+        if paren:
+            line += " " + paren
+        if line not in out:
+            out.append(line)
+        if len(out) >= 10:
+            break
+    return out
+
+
+def _clean_html_text(raw):
+    """Strip tags/entities and collapse whitespace to a single clean line."""
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw))).strip()
+
+
+def _fetch_page_excerpt(url):
+    """Fetch a result page and return clean fixture data, or (None, 0).
+
+    Search snippets only describe a page ("Liveticker, Spielplan ...") and rarely
+    contain the concrete answer. For the top results we fetch the body and keep
+    ONLY clean, marker-qualified 'Team - Team' pairings. Anything noisier is
+    discarded so the small model is never fed navigation junk it would
+    hallucinate from. Never raises (search must not crash the proxy).
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": _SEARCH_UA})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        raw = response.read(400000).decode("utf-8", "ignore")
+    raw = re.sub(r"<(script|style|nav|header|footer)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+    text = _clean_html_text(raw)
+    pairings = _extract_pairings(text)
+    if len(pairings) >= 2:
+        return (" | ".join(pairings)[:900], len(pairings))
+    return (None, 0)
+
+
 def _search_duckduckgo(query):
-    """General web search via the DuckDuckGo Lite endpoint (no API key).
+    """General web search via DuckDuckGo Lite (no API key), optionally enriched
+    with clean fixture data from the top result pages.
 
     Returns real result snippets (actual page text) for ANY topic - weather,
     sports, prices, facts - not just news headlines. The Lite endpoint accepts a
     POST form and returns plain result rows that are easy to parse and, unlike
     the JS/html.duckduckgo.com endpoints, does not bot-challenge simple clients.
+    When the query is about fixtures, we additionally fetch the top result pages
+    and attach clean 'Team - Team' pairings IF (and only if) we find them; this
+    never regresses other topics, which keep the honest snippet behaviour.
     """
-    data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+    search_query = _to_search_query(query)
+    # Fixture/schedule queries: bias toward pages that list kickoff times in
+    # plain text (our extractor needs 'HH:MM Uhr: Team - Team'); live JS tables
+    # rarely expose this. These extra keywords surface schedule/article pages.
+    low_q = query.lower()
+    if any(k in low_q for k in ("spielplan", "paarungen", "begegnungen", "wer spielt", "spiele")) and \
+       any(k in low_q for k in ("heute", "heutigen", "wm", "fußball", "fussball", "weltmeister")):
+        search_query += " wer spielt heute Uhrzeit Gegner Paarungen"
+    data = urllib.parse.urlencode({"q": search_query}).encode("utf-8")
     req = urllib.request.Request(
         "https://lite.duckduckgo.com/lite/",
         data=data,
@@ -483,11 +584,13 @@ def _search_duckduckgo(query):
     with urllib.request.urlopen(req, timeout=12) as response:
         page = response.read().decode("utf-8", "ignore")
 
-    def _clean(raw):
-        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw))).strip()
-
-    titles = [_clean(t) for t in re.findall(r'class=["\']result-link["\'][^>]*>(.*?)</a>', page, re.S)]
-    snippets = [_clean(s) for s in re.findall(r'class=["\']result-snippet["\'][^>]*>(.*?)</td>', page, re.S)]
+    anchors = re.findall(
+        r'<a[^>]*href="(https?://[^"]+)"[^>]*class=["\']result-link["\'][^>]*>(.*?)</a>',
+        page, re.S,
+    )
+    urls = [u for u, _ in anchors]
+    titles = [_clean_html_text(t) for _, t in anchors]
+    snippets = [_clean_html_text(s) for s in re.findall(r'class=["\']result-snippet["\'][^>]*>(.*?)</td>', page, re.S)]
 
     items = []
     for i, snip in enumerate(snippets):
@@ -500,9 +603,27 @@ def _search_duckduckgo(query):
             items.append(entry)
         if len(items) >= 4:
             break
-    if not items:
+
+    # Only attach page data when we found clean fixtures; otherwise stay with the
+    # honest snippet behaviour (no hallucination-prone nav scraping).
+    page_data = None
+    for u in urls[:8]:
+        try:
+            excerpt, pairs = _fetch_page_excerpt(u)
+        except Exception:  # noqa: BLE001 - enrichment is best-effort
+            continue
+        if pairs >= 2:
+            page_data = excerpt
+            break
+
+    parts = []
+    if page_data:
+        parts.append("SEITE: " + page_data)
+    if items:
+        parts.append(" | ".join(items))
+    if not parts:
         return None
-    return " | ".join(items)[:700]
+    return " || ".join(parts)[:1100]
 
 
 def _search_google_news(query):
