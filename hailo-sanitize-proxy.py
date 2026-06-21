@@ -734,14 +734,10 @@ def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
                     grounding = (
                         "AKTUELLE INTERNET-DATEN (heute abgerufen) zu meiner Frage "
                         "\"%s\": %s. "
-                        "Beantworte meine Frage in HOECHSTENS 3 kurzen Saetzen, "
-                        "ausschliesslich auf Basis dieser Daten. Nenne nur "
-                        "konkrete Fakten (Namen, Zahlen, Daten) und KEINE "
-                        "Wiederholungen. Erfinde NICHTS: Wenn die Daten die "
-                        "konkrete Antwort NICHT enthalten, sage genau einen Satz: "
-                        "'Dazu finde ich aktuell keine konkreten Angaben.' und fasse "
-                        "danach kurz die relevanten Daten zusammen. Sage NICHT, dass "
-                        "man es online nachschlagen muss."
+                        "Beantworte meine Frage NUR mit konkreten Fakten aus diesen "
+                        "Daten (Namen, Zahlen, Zeiten, Paarungen), kurz und ohne "
+                        "Wiederholungen. Erfinde nichts und verweise NICHT darauf, "
+                        "dass man es online nachschlagen muss."
                     ) % (clean_query, search_result)
                     clean_msgs.append({"role": "user", "content": grounding})
                     web_search_injected = True
@@ -1390,6 +1386,29 @@ def estimate_prompt_tokens(original_body):
     return max(1, total_chars // 4)
 
 
+_NOANSWER_RE = re.compile(
+    r"\s*Dazu finde ich (?:aktuell )?keine konkreten Angaben\.?",
+    re.IGNORECASE,
+)
+
+
+def strip_noanswer_filler(content):
+    """Remove the 'no concrete data' filler sentence when a real answer exists.
+
+    The small model often appends 'Dazu finde ich aktuell keine konkreten
+    Angaben.' even after giving a perfectly good grounded answer (e.g. a weather
+    report). Strip the phrase whenever there is other substantial content; keep
+    it only when it is essentially the whole reply (a genuine no-result case).
+    """
+    if not content or "keine konkreten Angaben" not in content:
+        return content
+    without = _NOANSWER_RE.sub(" ", content).strip()
+    # If stripping leaves real content, the filler was spurious -> drop it.
+    if len(without) >= 40:
+        return re.sub(r"\s{2,}", " ", without).strip()
+    return content
+
+
 def sanitize_response(
     data,
     allowed_tool_names=None,
@@ -1432,6 +1451,7 @@ def sanitize_response(
                 )
             if COLLAPSE_REPETITION_ENABLED:
                 content = collapse_repetition(content)
+            content = strip_noanswer_filler(content)
             # If we parsed a tool call but suppressed it, never leak the raw JSON
             # block to the user — replace it with a short, honest fallback.
             if suppressed:
