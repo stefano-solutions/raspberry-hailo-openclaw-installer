@@ -456,39 +456,68 @@ def should_trigger_web_search(user_message):
     return False
 
 
+# === WEBSEARCH-BLOCK-START (managed region; the Gemini case_fixer may rewrite
+# everything between these sentinels — keep them on their own lines, unchanged) ===
+# everything between these sentinels — keep them on their own lines, unchanged) ===
+import urllib.request
+import urllib.parse
+import re
+import html
+import sys
+
 _SEARCH_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 )
 
-
-_SEARCH_STOPWORDS = {
-    "suche", "such", "im", "internet", "netz", "online", "nach", "gib", "gibt",
-    "die", "den", "das", "der", "und", "in", "zeilen", "aus", "mir", "bitte",
-    "mal", "nun", "dann", "etwas", "finde", "heraus", "schau", "recherchiere",
-    "recherche", "google", "ein", "eine", "einen", "auf", "liste", "zeig",
-    "zeige", "ist", "sind", "was", "wie", "wo", "ob", "search", "the", "web",
-    "for", "look", "up", "find", "out", "me", "please", "a", "an", "of",
+# A more minimal set of stopwords, focusing on command/filler words that rarely
+# add search value. Crucial keywords like "heute", "wm", "pi", "was", "wie", "wo"
+# are explicitly kept or handled by length/capitalization rules.
+_SEARCH_STOPWORDS_MINIMAL = {
+    "im", "in", "die", "den", "das", "der", "und", "ein", "eine", "einen", "auf",
+    "mir", "bitte", "mal", "nun", "dann", "etwas", "gibt", "aus", "zeilen",
+    "suche", "such", "finde", "heraus", "schau", "recherchiere", "recherche",
+    "google", "liste", "zeig", "zeige", "ist", "sind", "ob",
+    "search", "the", "web", "for", "look", "up", "find", "out", "me", "please", "a", "an", "of",
+    "nach", # "nach den heutigen Spielen" -> "heutigen Spielen"
+    "internet", "netz", "online", # if the query is "suche im internet", these are commands
 }
+
+# Explicitly keep short but important technical/domain-specific terms
+_IMPORTANT_SHORT_WORDS = {"wm", "pi", "tv", "pc", "os", "ai", "llm"}
 
 
 def _to_search_query(text):
     """Reduce a verbose natural-language request to keyword search terms.
 
-    Search engines rank concise keyword queries far better than full sentences
-    ("Suche im Internet nach den heutigen Fussball ... und gib ... aus" buries
-    the data pages). We drop filler/command words but always keep capitalised
-    tokens (proper nouns) and longer content words. Falls back to the original.
+    Search engines rank concise keyword queries far better than full sentences.
+    This function now uses a more conservative stopword list, prioritizes
+    capitalized words (proper nouns), and explicitly keeps important short words
+    and time-sensitive keywords like "heute". It falls back to the original text
+    if the cleaned query becomes too short or empty.
     """
-    tokens = re.findall(r"[\wäöüÄÖÜß.-]+", str(text or ""))
+    original_text = str(text or "").strip()
+    tokens = re.findall(r"[\wäöüÄÖÜß.-]+", original_text)
     kept = []
     for tok in tokens:
         low = tok.lower().strip(".-")
-        if len(low) <= 2 or low in _SEARCH_STOPWORDS:
-            continue
-        kept.append(tok)
+        # Always keep capitalized words (likely proper nouns), if they are not single letters
+        if tok[0].isupper() and len(tok) > 1:
+            kept.append(tok)
+        # Explicitly keep important short words
+        elif low in _IMPORTANT_SHORT_WORDS:
+            kept.append(tok)
+        # Explicitly keep time-sensitive keywords
+        elif low in ("heute", "heutigen", "aktuell"):
+            kept.append(tok)
+        # Keep words longer than 2 characters, unless they are minimal stopwords
+        elif len(low) > 2 and low not in _SEARCH_STOPWORDS_MINIMAL:
+            kept.append(tok)
+
     query = " ".join(kept).strip()
-    return query if len(query) >= 3 else str(text or "").strip()
+    # If the cleaned query is too short or empty, fall back to the original text
+    # This helps with generic commands like "dann suche im internet"
+    return query if len(query) >= 3 else original_text
 
 
 def _extract_pairings(text):
@@ -499,20 +528,20 @@ def _extract_pairings(text):
     '21:00 Uhr: Kanada gegen Bosnien-Herzegowina'. Requiring the time prefix
     separates true fixtures from article asides/nav crumbs.
 
-    Separators are matched ONLY when surrounded by spaces (' - ', ' gegen ',
-    ' vs '), so hyphenated country names ('Bosnien-Herzegowina', 'Saudi-Arabien')
-    are never split, and the lowercase 'gegen' can't be absorbed into a team name
-    (each team word must start with a capital letter).
+    The regex for time and separators is made more flexible to capture more variations.
     """
     name = r"[A-ZÄÖÜ][\wäöüß.-]*(?:\s[A-ZÄÖÜ][\wäöüß.-]+){0,2}"
     sep = r"(?:\s+gegen\s+|\s+vs\.?\s+|\s+[–-]\s+)"
+    # Make time part more flexible: allow '.' or ':' for minutes, optional "Uhr",
+    # and optional colon/space after the time.
     pat = re.compile(
-        r"(\d{1,2}[:.]\d{2})\s*Uhr[:\s]+(%s)%s(%s)\s*(\([^)]{2,40}\))?"
+        r"(\d{1,2}[.:]\d{2})\s*(?:Uhr)?[:\s]+(%s)%s(%s)\s*(\([^)]{2,40}\))?"
         % (name, sep, name)
     )
     out = []
     for m in pat.finditer(text):
         t, a, b, paren = m.groups()
+        t = t.replace('.', ':') # Normalize time format to HH:MM
         a, b = a.strip(), b.strip()
         if any(ch.isdigit() for ch in a + b) or len(a) < 3 or len(b) < 3:
             continue
@@ -540,15 +569,18 @@ def _fetch_page_excerpt(url):
     discarded so the small model is never fed navigation junk it would
     hallucinate from. Never raises (search must not crash the proxy).
     """
-    req = urllib.request.Request(url, headers={"User-Agent": _SEARCH_UA})
-    with urllib.request.urlopen(req, timeout=10) as response:
-        raw = response.read(400000).decode("utf-8", "ignore")
-    raw = re.sub(r"<(script|style|nav|header|footer)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
-    text = _clean_html_text(raw)
-    pairings = _extract_pairings(text)
-    if len(pairings) >= 2:
-        return (" | ".join(pairings)[:900], len(pairings))
-    return (None, 0)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _SEARCH_UA})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            raw = response.read(400000).decode("utf-8", "ignore")
+        raw = re.sub(r"<(script|style|nav|header|footer)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+        text = _clean_html_text(raw)
+        pairings = _extract_pairings(text)
+        if len(pairings) >= 1: # Changed from >= 2 to >= 1 to allow single game results
+            return (" | ".join(pairings)[:900], len(pairings))
+        return (None, 0)
+    except Exception: # Catch all exceptions to prevent crash
+        return (None, 0)
 
 
 def _search_duckduckgo(query):
@@ -570,86 +602,93 @@ def _search_duckduckgo(query):
     low_q = query.lower()
     if any(k in low_q for k in ("spielplan", "paarungen", "begegnungen", "wer spielt", "spiele")) and \
        any(k in low_q for k in ("heute", "heutigen", "wm", "fußball", "fussball", "weltmeister")):
-        search_query += " wer spielt heute Uhrzeit Gegner Paarungen"
-    data = urllib.parse.urlencode({"q": search_query}).encode("utf-8")
-    req = urllib.request.Request(
-        "https://lite.duckduckgo.com/lite/",
-        data=data,
-        headers={
-            "User-Agent": _SEARCH_UA,
-            "Referer": "https://lite.duckduckgo.com/",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=12) as response:
-        page = response.read().decode("utf-8", "ignore")
+        # Ensure "heute" is strongly present in the search query if requested
+        if "heute" not in search_query.lower() and "heutigen" not in search_query.lower():
+            search_query += " heute"
+        search_query += " Uhrzeit Gegner Paarungen" # Add specific keywords for better fixture search
 
-    anchors = re.findall(
-        r'<a[^>]*href="(https?://[^"]+)"[^>]*class=["\']result-link["\'][^>]*>(.*?)</a>',
-        page, re.S,
-    )
-    urls = [u for u, _ in anchors]
-    titles = [_clean_html_text(t) for _, t in anchors]
-    snippets = [_clean_html_text(s) for s in re.findall(r'class=["\']result-snippet["\'][^>]*>(.*?)</td>', page, re.S)]
+    try: # Wrap the entire function in a try-except block
+        data = urllib.parse.urlencode({"q": search_query}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://lite.duckduckgo.com/lite/",
+            data=data,
+            headers={
+                "User-Agent": _SEARCH_UA,
+                "Referer": "https://lite.duckduckgo.com/",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=12) as response:
+            page = response.read().decode("utf-8", "ignore")
 
-    items = []
-    for i, snip in enumerate(snippets):
-        if not snip:
-            continue
-        title = titles[i] if i < len(titles) else ""
-        # Title + snippet gives the model both the source label and real facts.
-        entry = ("%s: %s" % (title, snip)).strip(": ") if title else snip
-        if entry and entry not in items:
-            items.append(entry)
-        if len(items) >= 4:
-            break
+        anchors = re.findall(
+            r'<a[^>]*href="(https?://[^"]+)"[^>]*class=["\']result-link["\'][^>]*>(.*?)</a>',
+            page, re.S,
+        )
+        urls = [u for u, _ in anchors]
+        titles = [_clean_html_text(t) for _, t in anchors]
+        snippets = [_clean_html_text(s) for s in re.findall(r'class=["\']result-snippet["\'][^>]*>(.*?)</td>', page, re.S)]
 
-    # Only attach page data when we found clean fixtures; otherwise stay with the
-    # honest snippet behaviour (no hallucination-prone nav scraping).
-    page_data = None
-    for u in urls[:8]:
-        try:
-            excerpt, pairs = _fetch_page_excerpt(u)
-        except Exception:  # noqa: BLE001 - enrichment is best-effort
-            continue
-        if pairs >= 2:
-            page_data = excerpt
-            break
+        items = []
+        for i, snip in enumerate(snippets):
+            if not snip:
+                continue
+            title = titles[i] if i < len(titles) else ""
+            # Title + snippet gives the model both the source label and real facts.
+            entry = ("%s: %s" % (title, snip)).strip(": ") if title else snip
+            if entry and entry not in items:
+                items.append(entry)
+            if len(items) >= 4:
+                break
 
-    parts = []
-    if page_data:
-        parts.append("SEITE: " + page_data)
-    if items:
-        parts.append(" | ".join(items))
-    if not parts:
+        # Only attach page data when we found clean fixtures; otherwise stay with the
+        # honest snippet behaviour (no hallucination-prone nav scraping).
+        page_data = None
+        for u in urls[:8]:
+            excerpt, pairs = _fetch_page_excerpt(u) # _fetch_page_excerpt now handles its own exceptions
+            if pairs >= 1: # Changed from >= 2 to >= 1
+                page_data = excerpt
+                break
+
+        parts = []
+        if page_data:
+            parts.append("SEITE: " + page_data)
+        if items:
+            parts.append(" | ".join(items))
+        if not parts:
+            return None
+        return " || ".join(parts)[:1100]
+    except Exception: # Catch all exceptions for _search_duckduckgo
         return None
-    return " || ".join(parts)[:1100]
 
 
 def _search_google_news(query):
     """Fallback: Google News RSS headlines (used only if DDG returns nothing)."""
-    url = (
-        "https://news.google.com/rss/search?q="
-        + urllib.parse.quote(query)
-        + "&hl=de&gl=DE&ceid=DE:de"
-    )
-    req = urllib.request.Request(url, headers={"User-Agent": _SEARCH_UA})
-    with urllib.request.urlopen(req, timeout=10) as response:
-        xml = response.read().decode("utf-8", "ignore")
-    titles = re.findall(r"<title>(.*?)</title>", xml, re.DOTALL)
-    items = []
-    for raw in titles[1:8]:  # first <title> is the feed name
-        value = html.unescape(re.sub(r"<[^>]+>", " ", raw)).strip()
-        if not value or value.lower() == "google news":
-            continue
-        value = re.sub(r"\s*[-\u2013]\s*[^-\u2013]{2,30}$", "", value).strip()
-        if value and value not in items:
-            items.append(value)
-        if len(items) >= 5:
-            break
-    if not items:
+    try: # Wrap the entire function in a try-except block
+        url = (
+            "https://news.google.com/rss/search?q="
+            + urllib.parse.quote(query)
+            + "&hl=de&gl=DE&ceid=DE:de"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": _SEARCH_UA})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            xml = response.read().decode("utf-8", "ignore")
+        titles = re.findall(r"<title>(.*?)</title>", xml, re.DOTALL)
+        items = []
+        for raw in titles[1:8]:  # first <title> is the feed name
+            value = html.unescape(re.sub(r"<[^>]+>", " ", raw)).strip()
+            if not value or value.lower() == "google news":
+                continue
+            value = re.sub(r"\s*[-\u2013]\s*[^-\u2013]{2,30}$", "", value).strip()
+            if value and value not in items:
+                items.append(value)
+            if len(items) >= 5:
+                break
+        if not items:
+            return None
+        return " | ".join(items)[:500]
+    except Exception: # Catch all exceptions for _search_google_news
         return None
-    return " | ".join(items)[:500]
 
 
 def perform_web_search(query):
@@ -670,6 +709,8 @@ def perform_web_search(query):
             )
             sys.stderr.flush()
     return None
+# === WEBSEARCH-BLOCK-END ===
+
 
 def sanitize_chat_body(body_bytes, tool_prompt_enabled=True):
     """Strip unsupported fields from /v1/chat/completions request."""
